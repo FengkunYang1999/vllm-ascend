@@ -1,0 +1,4 @@
+pr: 1
+entries:
+  - category: feature
+    text: Added experimental MLA PrologV3 preprocessing for supported BF16 PCP-only configurations with Model Runner V2.
