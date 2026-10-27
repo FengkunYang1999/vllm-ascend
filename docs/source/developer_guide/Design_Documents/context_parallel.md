@@ -119,6 +119,60 @@ During chunked or cached prefill, the local query must attend to KV-cache shards
 
 PCP-only GQA and MLA gather current K/V or latent KV for cache insertion while computing local queries. With PCP+DCP, GQA maps merged history results back to local query fragments and combines them with attention over current-token causal prefixes. MLA gathers history KV in bounded chunks; senders derive a shared plan from the global batch so differing local fragment lengths produce matching collective sizes.
 
+#### MLA PCP PrologV3 preprocessing
+
+`AscendMLAImpl` provides an experimental PCP-only PrologV3 route. Admission is
+split between `supports_pcp_prolog_v3()` and `_can_use_pcp_prolog_v3()`: the layer
+must use Model Runner V2, BF16 unquantized projections, compressed queries, RoPE,
+one KV head, and a supported PrologV3 operator and input width. It also requires
+resident weights, prepared private PrologV3 weights and workspace, actual
+PCP-sharded metadata, and two contiguous BF16 cache components. DCP, external
+FlashMLA, weight offloading, attention quantization, NZ caches, and unsupported
+projection/cache configurations retain their existing routes.
+
+The metadata builder derives `pcp_prolog_local_slots` from the current rank's row
+of the expanded slot mapping and keeps `pcp_prolog_global_slots` in rank-major
+order. For `P` ranks with `L` padded input rows each, these contain `L` and `P * L`
+entries respectively. Hidden states, RoPE tables, and local slots must describe
+the same padded rows. Invalid metadata or insufficient workspace raises an error
+before the fused operation; it is not treated as a configuration fallback.
+
+`mla_preprocess_pcp_prolog_v3()` performs one KV exchange for the entire local
+batch, including sharded decode and prefill:
+
+1. Run PrologV3 over the local padded input using a persistent, per-layer dense
+   current-KV workspace. The operator receives unique nonnegative indices
+   `arange(L)` into that workspace, including for padding rows.
+2. Pack the workspace's latent KV and RoPE rows. Use negative entries in
+   `pcp_prolog_local_slots` only to clear padding payloads to zero; these slots
+   are not passed to PrologV3. Clearing by assignment also removes NaN/Inf values
+   from padding rows.
+3. All-gather the equal-sized payloads in rank-major order. Ranks with no actual
+   queries still join this collective whenever the padded batch is nonempty.
+4. Scatter the gathered rows into the real KV cache using
+   `pcp_prolog_global_slots`, then notify the cache connector of the write.
+5. Construct local decode and prefill inputs after this shared exchange. Decode
+   consumes PrologV3's absorbed query. Prefill computes its ordinary, unabsorbed
+   query and expands the normalized current latent KV through `kv_b_proj` for
+   the existing prefill attention implementation.
+
+This follows SFA's compute-then-exchange pattern with a private workspace as the
+initial write target. It avoids relying on PrologV3 accepting negative cache
+indices and does not read current rows back from the historical cache for packing.
+The existing SFA cache-copy helper is unchanged. Cache lifecycle waits precede
+publication, and the write, pack, gather, and scatter retain their stream order.
+Existing prefix/chunked-context attention and output projection consume the
+resulting cache and local queries.
+
+The workspace and private weights are prepared during model loading so their
+memory is included before KV-cache sizing. Workspace capacity covers the larger
+of `max_num_batched_tokens` and the configured graph capture sizes; its storage
+is retained across calls. This adds per-layer device memory and leaves additional
+ordinary Q projection work in prefill. Stable storage alone does not establish
+graph correctness. NPU numerical checks, distributed execution, graph
+capture/replay, and baseline-versus-new-route latency, throughput, and memory
+benchmarks remain required for this initial integration.
+
 ### Decode
 
 Decode gathers the query heads required by each DCP rank, computes attention against the local KV-cache shard, and combines partial outputs and LSE values across the DCP group.

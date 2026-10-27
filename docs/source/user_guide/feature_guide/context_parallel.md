@@ -62,6 +62,35 @@ When PCP size is greater than 1, PCP stores embedding and LM Head weights as TPÃ
 
 With PCP enabled, O-projection weight sharding is on by default for SFA-PCP O-projection and DSA-PCP two-stage O-projection (`wo_a`/`wo_b`). If the weight method or PCP partition does not support sharding, the option is disabled with a warning. Set `enable_pcp_o_proj_weight_sharding` to `false` to disable it. Other attention backends do not use this option. O-projection sharding is incompatible with fine-grained TP for the same modules.
 
+#### MLA PrologV3 preprocessing
+
+MLA has an experimental PrologV3 preprocessing route for Model Runner V2 with
+`prefill_context_parallel_size > 1` and `decode_context_parallel_size = 1`.
+It is selected automatically for eligible layers and batches. Its scope is
+narrower than the overall MLA/PCP compatibility table above:
+
+- BF16 layers with unquantized projections, compressed queries, and RoPE.
+- A TorchNPU installation exposing `npu_mla_prolog_v3`, with projection dimensions
+  accepted by the MLA PrologV3 writer.
+- Two contiguous BF16 KV-cache components for latent KV and RoPE, with one KV head.
+- Resident projection weights and a prepared per-layer workspace, with PCP-sharded
+  batch metadata. Weight offloading and external FlashMLA are excluded.
+
+Configurations outside this scope continue through their existing preprocessing
+routes. This includes PCP+DCP, quantized projections or attention, NZ caches, and
+unsupported cache layouts or projection dimensions.
+
+The route synchronizes current KV for sharded decode, prefill, and mixed batches;
+ranks with only padding still participate. Its persistent workspace is allocated
+during model loading and accounted for before KV-cache sizing. It uses additional
+device memory, and prefill retains its ordinary query projection. NPU numerical
+correctness, graph capture/replay, and end-to-end performance remain to be
+validated for this initial integration. The workspace cost and additional prefill
+projection work require workload-specific benchmarking.
+
+See [MLA PCP PrologV3 preprocessing](../../developer_guide/Design_Documents/context_parallel.md#mla-pcp-prologv3-preprocessing)
+for the data flow and implementation contracts.
+
 #### Speculative Decoding
 
 PCP supports MTP with MLA, SFA, and DeepSeek-V4 DSA models, Eagle3 with

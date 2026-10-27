@@ -268,6 +268,9 @@ class AscendMLAMetadata:
     # sharded-decode PCP KV gather.
     pcp_cos: torch.Tensor | None = None
     pcp_sin: torch.Tensor | None = None
+    # Physical history slots in local input order and PCP all-gather order.
+    pcp_prolog_local_slots: torch.Tensor | None = None
+    pcp_prolog_global_slots: torch.Tensor | None = None
     # Resolved by the builder; execution must not infer layout from tensor sizes.
     uses_pcp_sharded_layout: bool = False
     external_flashmla: FlashMLADecode | None = None
@@ -685,6 +688,10 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
         metadata.uses_pcp_sharded_layout = True
         metadata.slot_mapping = expanded_slot_mapping
+        if self.is_pcp_decode_sharded:
+            rank_slots = expanded_slot_mapping.view(self.pcp_size, local_num_input_tokens)
+            metadata.pcp_prolog_local_slots = rank_slots[get_pcp_group().rank_in_group].contiguous()
+            metadata.pcp_prolog_global_slots = rank_slots.reshape(-1)
         if metadata.num_prefills > 0:
             prefill_metadata = metadata.prefill
             assert prefill_metadata is not None
@@ -1063,6 +1070,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self._mlapo_uses_native_weights = False
         self.use_flashmla: bool = self._can_use_flashmla()
         self._flashmla_writer_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._pcp_prolog_v3_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def _can_use_flashmla(self) -> bool:
         config = self.vllm_config
@@ -1395,6 +1403,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             return
         config = self.vllm_config
         if enable_sfa(config):
+            return
+        if getattr(self, "use_pcp", False) and self.supports_pcp_prolog_v3():
+            self._prepare_prolog_v3_weights()
+            self._prepare_pcp_prolog_v3_buffers()
             return
         if not config.use_v2_model_runner and (
             hasattr(config.model_config.hf_config, "compress_ratios")
@@ -1921,6 +1933,63 @@ class AscendMLAImpl(MLAAttentionImpl):
             getattr(self.fused_qkv_a_proj, "input_size", None) in PROLOG_V3_SUPPORTED_INPUT_SIZES
         )
 
+    def supports_pcp_prolog_v3(self) -> bool:
+        """Admit BF16 PCP-only layers independently of strided-cache allocation."""
+        return (
+            self.vllm_config.use_v2_model_runner
+            and self.use_pcp
+            and not self.use_dcp
+            and self.is_pcp_decode_sharded
+            and self.num_kv_heads == 1
+            and isinstance(get_offloader(), NoopOffloader)
+            and self.supports_prolog_v3_writer()
+            and self._get_context_prolog_quant_method(self.fused_qkv_a_proj) is None
+            and self._get_context_prolog_quant_method(self.q_proj) is None
+        )
+
+    def _prepare_pcp_prolog_v3_buffers(self) -> None:
+        """Account for dense current-KV storage during loading, before KV sizing."""
+        if self._pcp_prolog_v3_buffers is not None:
+            return
+        capacity = max(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            max(self.vllm_config.compilation_config.cudagraph_capture_sizes or [0]),
+        )
+        block_size = self.vllm_config.cache_config.block_size
+        shape = (cdiv(capacity, block_size), block_size, self.num_kv_heads)
+        self._pcp_prolog_v3_buffers = (
+            torch.empty((*shape, self.kv_lora_rank), dtype=self.dtype, device=self.W_UV.device),
+            torch.empty((*shape, self.qk_rope_head_dim), dtype=self.dtype, device=self.W_UV.device),
+            torch.arange(capacity, dtype=torch.int64, device=self.W_UV.device),
+        )
+
+    def _can_use_pcp_prolog_v3(self, kv_cache, attn_metadata) -> bool:
+        """Use the same protocol on every rank, including ranks with no queries."""
+        if not (
+            self.supports_pcp_prolog_v3()
+            and attn_metadata.uses_pcp_sharded_layout
+            and attn_metadata.external_flashmla is None
+            and self._pcp_prolog_v3_buffers is not None
+            and getattr(self, "_prolog_v3_weights", None) is not None
+            and isinstance(kv_cache, tuple)
+            and len(kv_cache) == 2
+        ):
+            return False
+        nope, rope = kv_cache
+        # Independent dense components have different block strides. The
+        # strided-writer validator intentionally requires a different layout.
+        return (
+            nope.dim() == rope.dim() == 4
+            and nope.is_contiguous()
+            and rope.is_contiguous()
+            and nope.dtype == rope.dtype == torch.bfloat16
+            and nope.device == rope.device
+            and nope.shape[:3] == rope.shape[:3]
+            and nope.shape[2] == 1
+            and nope.shape[-1] == self.kv_lora_rank
+            and rope.shape[-1] == self.qk_rope_head_dim
+        )
+
     def _uses_strided_kv_adapter(self) -> bool:
         """A5 drafts with unsupported He retain their strided cache via scatter.
 
@@ -2430,6 +2499,93 @@ class AscendMLAImpl(MLAAttentionImpl):
             current_nope_cache.flatten(0, 1)[:num_tokens],
             current_pe_cache.flatten(0, 1)[:num_tokens],
         )
+
+    def _pcp_prolog_v3_prefill_result(self, hidden_states, attn_metadata, written_kv):
+        """Keep ordinary prefill Q while expanding the already normalized KV."""
+        start, end = attn_metadata.num_decode_tokens, attn_metadata.num_actual_tokens
+        qkv_lora = self.fused_qkv_a_proj(hidden_states[start:end])[0]
+        q_c = self.q_a_layernorm(qkv_lora[..., : self.q_lora_rank])
+        query = self.q_proj(q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+        q_nope, q_pe = query.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe = self.rope_single(q_pe, attn_metadata.pcp_cos[start:end], attn_metadata.pcp_sin[start:end])
+        k_pe, latent = (kv[start:end] for kv in written_kv)
+        projected = self.kv_b_proj(latent.reshape(-1, self.kv_lora_rank))[0]
+        projected = projected.view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, value = projected.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
+        return PrefillMLAPreprocessResult(q_nope, q_pe, k_nope, k_pe, value)
+
+    def mla_preprocess_pcp_prolog_v3(self, hidden_states, kv_cache, attn_metadata):
+        """Fuse local preprocessing, then publish KV before local attention."""
+        local_slots = attn_metadata.pcp_prolog_local_slots
+        global_slots = attn_metadata.pcp_prolog_global_slots
+        cos, sin = attn_metadata.pcp_cos, attn_metadata.pcp_sin
+        if local_slots is None or global_slots is None or cos is None or sin is None:
+            raise RuntimeError("PCP PROLOG_V3 requires local/global slots and padded RoPE metadata")
+        group = get_pcp_group()
+        num_tokens = local_slots.numel()
+        actual = attn_metadata.num_actual_tokens
+        decodes = attn_metadata.num_decode_tokens
+        if not (
+            hidden_states.shape[0] == cos.shape[0] == sin.shape[0] == num_tokens
+            and global_slots.numel() == group.world_size * num_tokens
+            and 0 <= decodes <= actual <= num_tokens
+        ):
+            raise RuntimeError("PCP PROLOG_V3 input rows, slots and token counts must agree")
+        if num_tokens == 0:
+            return None, None
+        buffers = self._pcp_prolog_v3_buffers
+        if buffers is None or num_tokens > buffers[2].numel():
+            raise RuntimeError("PCP PROLOG_V3 workspace does not cover the padded input")
+
+        # Match the existing cache lifecycle before either local or remote KV
+        # can be published. Even an empty query rank writes other ranks' KV.
+        assert self.layer_name is not None
+        if actual > decodes or (
+            self.layerwise_kv_cache_hook is not None and getattr(self.layerwise_kv_cache_hook, "layerwise", False)
+        ):
+            wait_for_kv_layer_from_connector(self.layer_name)
+        if self.layerwise_kv_cache_hook is not None:
+            self.layerwise_kv_cache_hook.wait_for_layer(self.layer_name)
+
+        # Use positive, unique workspace slots for padding too. This avoids
+        # relying on PROLOG's negative-slot behavior or touching history early.
+        nope_buffer, rope_buffer, indices = buffers
+        num_blocks = cdiv(num_tokens, nope_buffer.shape[1])
+        workspace = (nope_buffer[:num_blocks], rope_buffer[:num_blocks])
+        prolog_outputs = self._run_prolog_v3(
+            hidden_states, cos, sin, workspace, indices[:num_tokens], quantize_query=False
+        )
+        latent = workspace[0].flatten(0, 1)[:num_tokens]
+        k_pe = workspace[1].flatten(0, 1)[:num_tokens]
+        packed = torch.cat((latent.squeeze(1), k_pe.squeeze(1)), dim=-1)
+        # Assignment, rather than multiplication, also clears NaN/Inf from PAD.
+        packed.masked_fill_((local_slots < 0).unsqueeze(-1), 0)
+        gathered = group.all_gather(packed, dim=0)
+        global_latent, global_rope = gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        DeviceOperator.reshape_and_cache(
+            key=global_latent.unsqueeze(1),
+            value=global_rope.unsqueeze(1),
+            key_cache=kv_cache[0],
+            value_cache=kv_cache[1],
+            slot_mapping=global_slots,
+        )
+        notify_kv_cache_written(self.layer_name)
+
+        # Both branches consume one completed KV exchange. V3's absorbed Q is
+        # suitable for decode; ordinary prefill Q is computed independently.
+        decode_result = prefill_result = None
+        if decodes:
+            heads = self._prolog_v3_weights["num_heads"]
+            q_nope = prolog_outputs[0].view(num_tokens, heads, self.kv_lora_rank)[:decodes, : self.num_heads]
+            q_pe = prolog_outputs[1].view(num_tokens, heads, self.qk_rope_head_dim)[:decodes, : self.num_heads]
+            q_nope, q_pe = self.reorg_decode_q(q_nope, q_pe)
+            decode_result = DecodeMLAPreprocessResult(q_nope, q_pe, kv_cache[0], kv_cache[1])
+        if actual > decodes:
+            local_latent, local_rope = packed[:actual].split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            written_kv = (local_rope.contiguous().unsqueeze(1), local_latent.contiguous().unsqueeze(1))
+            prefill_result = self._pcp_prolog_v3_prefill_result(hidden_states, attn_metadata, written_kv)
+        return decode_result, prefill_result
 
     def mla_preprocess_prolog_v3(self, hidden_states, kv_cache, attn_metadata):
         """Use PROLOG_V3 for both decode and prefill MLA preprocessing.
@@ -3458,7 +3614,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             and not self.enable_kv_nz
             and attn_metadata.num_decode_tokens > 0
         )
-        if use_prolog_v3_strided_cache:
+        if self.use_pcp and self._can_use_pcp_prolog_v3(kv_cache, attn_metadata):
+            decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_pcp_prolog_v3(
+                hidden_states, kv_cache, attn_metadata
+            )
+        elif use_prolog_v3_strided_cache:
             decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_prolog_v3(
                 hidden_states, kv_cache, attn_metadata
             )
