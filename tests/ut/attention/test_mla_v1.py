@@ -10,6 +10,8 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl
+from vllm_ascend.attention.context_parallel.mla_pcp import AscendMlaPCPImpl
 from vllm_ascend.attention.mla_v1 import (
     AscendMLABackend,
     AscendMLADecodeMetadata,
@@ -391,7 +393,7 @@ class TestAscendMLABackend(TestBase):
     def test_get_impl_cls(self):
         self.assertEqual(AscendMLABackend.get_impl_cls(), AscendMLAImpl)
         self.mock_parallel_config.prefill_context_parallel_size = 2
-        self.assertIs(AscendMLABackend.get_impl_cls(), AscendMLAImpl)
+        self.assertIs(AscendMLABackend.get_impl_cls(), AscendMlaPCPImpl)
 
     def test_get_supported_kernel_block_sizes(self):
         result = AscendMLABackend.get_supported_kernel_block_sizes()
@@ -407,7 +409,9 @@ class TestAscendMLABackend(TestBase):
     def test_get_impl_cls_with_dcp(self, mock_enable_dcp):
         mock_enable_dcp.return_value = True
         impl_cls = AscendMLABackend.get_impl_cls()
-        self.assertIsNotNone(impl_cls)
+        self.assertIs(impl_cls, AscendMlaDCPImpl)
+        self.mock_parallel_config.prefill_context_parallel_size = 2
+        self.assertIs(AscendMLABackend.get_impl_cls(), AscendMlaDCPImpl)
 
 
 def _make_pcp_metadata(

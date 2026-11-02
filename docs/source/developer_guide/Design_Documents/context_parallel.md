@@ -119,6 +119,48 @@ During chunked or cached prefill, the local query must attend to KV-cache shards
 
 PCP-only GQA and MLA gather current K/V or latent KV for cache insertion while computing local queries. With PCP+DCP, GQA maps merged history results back to local query fragments and combines them with attention over current-token causal prefixes. MLA gathers history KV in bounded chunks; senders derive a shared plan from the global batch so differing local fragment lengths produce matching collective sizes.
 
+#### MLA PCP PrologV3 preprocessing
+
+`AscendMlaPCPImpl` extends `AscendMLAImpl` for PCP-only execution. The backend
+factory selects DCP first, PCP second, and the ordinary implementation otherwise.
+The subclass overrides weight loading and `_mla_preprocess`; shared forward,
+attention, output gates, and output projection retain their existing dispatch.
+Unsupported layers and batch layouts delegate to the base preprocessing method.
+
+For `P` PCP ranks with `L` padded input rows per rank, the existing metadata
+builder provides `P * L` physical history slots in rank-major order. The subclass
+views this mapping as `[P, L]` to select its local row. No additional slot fields
+or independent metadata copies are needed. Hidden states and padded RoPE tables
+must each contain `L` rows; actual local tokens may be fewer or zero.
+
+The admitted BF16 route performs the following operations:
+
+1. PrologV3 processes all local padded rows, writing normalized latent KV and
+   rotated key positions into a persistent dense workspace using `arange(L)`.
+   These nonnegative indices are independent of padding slots in history.
+2. The subclass packs the two workspace components, replaces padding payloads
+   with zero, and performs one PCP all-gather before any local decode/prefill
+   branch. A rank with no actual queries still participates when `L > 0`.
+3. `DeviceOperator.reshape_and_cache` publishes the gathered rows into the real
+   cache using the original rank-major mapping, then the connector is notified.
+4. Decode uses the operator's absorbed query. Prefill recomputes ordinary Q and
+   calls the existing `mla_preprocess_prefill` with `written_kv`, avoiding another
+   KV write or collective while reusing the native RoPE and K/V expansion path.
+
+The subclass prepares private operator weights and dense workspaces during model
+loading, before KV-cache sizing. Repeated weight loading uses the base class's
+in-place refresh and keeps workspace addresses. Capacity covers scheduler and
+configured graph padding bounds; malformed input metadata or insufficient
+capacity raises before the fused operation rather than silently falling back.
+Workspace address stability does not establish graph replay correctness.
+
+The temporary cache deliberately differs from SFA's direct-history-write and
+cache-readback path. This avoids depending on PrologV3 accepting negative padding
+indices. It also costs per-layer memory. Prefill repeats projection work, and
+mixed batches include decode rows in the repeated A-projection and normalization
+to preserve the native prefill adapter's indexing contract. Hardware numerical,
+distributed, graph, connector, and performance validation remain necessary.
+
 ### Decode
 
 Decode gathers the query heads required by each DCP rank, computes attention against the local KV-cache shard, and combines partial outputs and LSE values across the DCP group.
