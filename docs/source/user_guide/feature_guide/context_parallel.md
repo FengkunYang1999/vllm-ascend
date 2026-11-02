@@ -62,6 +62,30 @@ When PCP size is greater than 1, PCP stores embedding and LM Head weights as TPÃ
 
 With PCP enabled, O-projection weight sharding is on by default for SFA-PCP O-projection and DSA-PCP two-stage O-projection (`wo_a`/`wo_b`). If the weight method or PCP partition does not support sharding, the option is disabled with a warning. Set `enable_pcp_o_proj_weight_sharding` to `false` to disable it. Other attention backends do not use this option. O-projection sharding is incompatible with fine-grained TP for the same modules.
 
+#### MLA PrologV3 preprocessing
+
+The experimental MLA PCP-only PrologV3 route is selected automatically for
+eligible Model Runner V2 layers with sharded decode requests. It requires BF16,
+unquantized resident Q/KV projections, compressed queries, RoPE, one KV head, a
+supported PrologV3 input width, and two contiguous BF16 cache components.
+The TorchNPU installation must expose `npu_mla_prolog_v3`.
+
+PCP+DCP, replicated draft batches, FP16, quantized projections or attention,
+NZ/strided caches, external FlashMLA, weight offloading, and fused QKV-A output
+gates keep their existing preprocessing routes. The overall PCP compatibility
+table above does not establish support for each combination with this new route.
+
+The route exchanges current KV for decode, prefill, and mixed batches, including
+ranks with only padding. It allocates a persistent workspace per layer during
+model loading. Prefill also recomputes the ordinary query projection; mixed
+batches repeat the A-projection and query normalization for their decode prefix.
+NPU numerical correctness, graph capture/replay, connector combinations, and
+end-to-end latency, throughput, and memory require validation on the deployment
+stack before production use.
+
+See [MLA PCP PrologV3 preprocessing](../../developer_guide/Design_Documents/context_parallel.md#mla-pcp-prologv3-preprocessing)
+for the execution and cache contracts.
+
 #### Speculative Decoding
 
 PCP supports MTP with MLA, SFA, and DeepSeek-V4 DSA models, Eagle3 with

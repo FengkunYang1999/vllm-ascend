@@ -142,6 +142,10 @@ class AscendMLABackend(AttentionBackend):
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl
 
             return AscendMlaDCPImpl
+        if get_current_vllm_config().parallel_config.prefill_context_parallel_size > 1:
+            from vllm_ascend.attention.context_parallel.mla_pcp import AscendMlaPCPImpl
+
+            return AscendMlaPCPImpl
         return AscendMLAImpl
 
     @staticmethod

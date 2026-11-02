@@ -1,0 +1,7 @@
+pr: 2
+entries:
+  - category: feature
+    text: >-
+      Added experimental PrologV3 preprocessing for eligible BF16, unquantized
+      MLA layers using PCP-only with sharded decode in Model Runner V2.
+      Unsupported layer and cache layouts retain their existing preprocessing routes.
