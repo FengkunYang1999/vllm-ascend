@@ -41,6 +41,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.offloader.base import NoopOffloader, get_offloader
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -1057,10 +1058,6 @@ def _uses_single_raw_mla_cache(
     if getattr(attn_module, "indexer", None) is not None:
         return False
     impl = getattr(attn_module, "impl", None)
-    if getattr(impl, "use_pcp", False) or getattr(impl, "is_pcp_decode_sharded", False):
-        # PCP gathers and sharded-decode writes still use the legacy
-        # preprocessing contract. Keep their allocation compatible with it.
-        return False
     if getattr(impl, "use_flashmla", False):
         # The external reader retains its fused-cache contract, including
         # DCP. Native FIA continues to follow the dependency's exclusions.
@@ -1068,6 +1065,46 @@ def _uses_single_raw_mla_cache(
     if enable_sfa(vllm_config):
         return False
     return supports_strided_mla_cache(vllm_config, attn_module, kv_cache_spec)
+
+
+def _can_split_pcp_prolog_history(
+    vllm_config: VllmConfig,
+    layer_names: Sequence[str],
+    specs: dict[str, KVCacheSpec],
+    layers: dict[str, Any],
+    shared_layers: dict[str, str],
+) -> bool:
+    """Replace an otherwise single-raw allocation only if *all* its consumers agree."""
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if (
+        getattr(parallel, "prefill_context_parallel_size", 1) <= 1
+        or parallel.decode_context_parallel_size != 1
+        or vllm_config.kv_transfer_config is not None
+        or not isinstance(get_offloader(), NoopOffloader)
+        or enable_fa_quant(vllm_config)
+        or any(name in shared_layers or name in shared_layers.values() for name in layer_names)
+    ):
+        return False
+    for name in layer_names:
+        spec = specs[name]
+        layer = layers.get(name)
+        if not isinstance(spec, AscendMLAAttentionSpec) or not isinstance(layer, MLAAttention):
+            return False
+        impl = layer.impl
+        if (
+            getattr(impl, "use_flashmla", False)
+            or not getattr(impl, "use_pcp", False)
+            or getattr(impl, "use_dcp", False)
+            or spec.dtype != torch.bfloat16
+            or spec.num_kv_heads != 1
+            or spec.page_size_bytes != spec.real_page_size_bytes
+            or spec.scale_dim
+            or spec.store_on_host
+            or spec.head_size != layer.kv_lora_rank + layer.qk_rope_head_dim
+            or getattr(impl, "_prolog_v3_weights", None) is None
+        ):
+            return False
+    return True
 
 
 def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable[KVCacheSpec]) -> bool:
@@ -1175,6 +1212,14 @@ def _allocate_kv_cache(
         Raw cache tensors or K/V tensor pairs, indexed by layer name.
     """
     vllm_config = get_current_vllm_config()
+    # Rebinding these cache groups must not leave the last allocation's route
+    # enabled (including when a special planner returns before the MLA branch).
+    layers = getattr(getattr(vllm_config, "compilation_config", None), "static_forward_context", {})
+    for group in kv_cache_config.kv_cache_groups:
+        for name in group.layer_names:
+            impl = getattr(layers.get(name), "impl", None)
+            if getattr(impl, "_pcp_prolog_uses_split_history", False):
+                impl._pcp_prolog_uses_split_history = False
     if KVPPConfig.from_vllm_config(vllm_config).size > 1:
         caches = allocate_kvpp_cache(vllm_config, kv_cache_config, device)
         specs = _get_layer_kv_cache_specs(kv_cache_config)
@@ -1507,9 +1552,24 @@ def _allocate_kv_cache(
             _uses_single_raw_mla_cache(vllm_config, layer_name, layer_kv_cache_spec[layer_name])
             for layer_name in shared_names
         ):
+            split_history = _can_split_pcp_prolog_history(
+                vllm_config, shared_names, layer_kv_cache_spec, layers, shared_layers
+            )
             for layer_name in shared_names:
-                raw_size = kv_cache_config.num_blocks * layer_kv_cache_spec[layer_name].page_size_bytes
-                kv_cache_raw_tensors[layer_name] = (_allocate_int8_cache_tensor(raw_size, alignment, device),)
+                spec = layer_kv_cache_spec[layer_name]
+                raw_size = kv_cache_config.num_blocks * spec.page_size_bytes
+                if split_history:
+                    # Each component owns dense pages. The existing tuple reshape
+                    # and paged history reader can consume them unchanged.
+                    layer = layers[layer_name]
+                    key_size = raw_size // spec.head_size * layer.kv_lora_rank
+                    kv_cache_raw_tensors[layer_name] = (
+                        _allocate_int8_cache_tensor(key_size, alignment, device),
+                        _allocate_int8_cache_tensor(raw_size - key_size, alignment, device),
+                    )
+                    layer.impl._pcp_prolog_uses_split_history = True
+                else:
+                    kv_cache_raw_tensors[layer_name] = (_allocate_int8_cache_tensor(raw_size, alignment, device),)
             continue
 
         # vLLM #51718 packs all group layers into one tensor on main; the

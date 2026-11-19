@@ -681,9 +681,15 @@ def test_v2_single_raw_mla_path_excludes_unsupported_modes(monkeypatch):
 
     attn_module.impl.use_pcp = True
     assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl._pcp_prolog_v3_buffers_are_sufficient = lambda: False
+    assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl._pcp_prolog_v3_buffers_are_sufficient = lambda: True
+    assert attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
     attn_module.impl.use_pcp = False
 
     attn_module.impl.is_pcp_decode_sharded = True
+    assert attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl._pcp_prolog_v3_buffers_are_sufficient = lambda: False
     assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
     attn_module.impl.is_pcp_decode_sharded = False
 
@@ -697,8 +703,13 @@ def test_v2_single_raw_mla_path_excludes_unsupported_modes(monkeypatch):
     )
     attn_module.impl._dcp_current_kv_buffers_are_sufficient = lambda: True
     assert attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl.use_pcp = True
+    assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl._pcp_prolog_v3_buffers_are_sufficient = lambda: True
+    assert attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
     attn_module.impl._dcp_current_kv_buffers_are_sufficient = lambda: False
     assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
+    attn_module.impl.use_pcp = False
     attn_module.impl._dcp_current_kv_buffers_are_sufficient = lambda: True
     attn_module.impl._dcp_current_kv_buffers = None
     assert not attn_utils._uses_single_raw_mla_cache(vllm_config, layer_name, spec)
@@ -739,6 +750,82 @@ def test_v2_flashmla_draft_cache_uses_selected_reader_with_sparse_target(monkeyp
     assert attn_utils._uses_single_raw_mla_cache(target_config, layer_name, spec)
     layer.impl.use_flashmla = False
     assert not attn_utils._uses_single_raw_mla_cache(target_config, layer_name, spec)
+
+
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
+@pytest.mark.parametrize("blocker", ["mixed_writer", "shared_consumer", "dcp", "kv_transfer", "padded_pages"])
+def test_v2_pcp_prolog_split_history_allocation_and_rebind(monkeypatch, blocker, device_type):
+    names = ["layer0", "layer1"]
+    spec = AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16)
+    layers = {}
+    for name in names:
+        layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(layer)
+        layer.kv_lora_rank, layer.qk_rope_head_dim = 512, 64
+        layer.impl = SimpleNamespace(
+            use_pcp=True,
+            use_dcp=False,
+            use_flashmla=False,
+            fa_quant_layer=False,
+            _pcp_prolog_v3_buffers_are_sufficient=lambda: True,
+            supports_strided_mla_writer=lambda: True,
+            _prolog_v3_weights={"loaded": True},
+        )
+        layers[name] = layer
+    config = SimpleNamespace(
+        additional_config={},
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        compilation_config=SimpleNamespace(static_forward_context=layers),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2, decode_context_parallel_size=1),
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        quant_config=None,
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *args, **kwargs: layers)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda config: False)
+    monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda config: False)
+    monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
+    backend = MagicMock()
+    backend.get_kv_cache_shape.side_effect = lambda n, b, h, d, *_: (n, b, h, d)
+    shared = {}
+
+    def allocate():
+        cfg = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[_make_kv_cache_tensor(4 * spec.page_size_bytes, names, spec.page_size_bytes)],
+            kv_cache_groups=[KVCacheGroupSpec(layer_names=names + list(shared), kv_cache_spec=spec)],
+        )
+        raw = attn_utils._allocate_kv_cache(cfg, shared_layers=shared, device=torch.device("cpu"))
+        group = AttentionGroup(backend=backend, layer_names=names, kv_cache_spec=spec, kv_cache_group_id=0)
+        return attn_utils._reshape_kv_cache_v2([group], raw, "auto", [128], shared, cfg)
+
+    cache = allocate()
+    for name in names:
+        k, v = cache[name]
+        assert layers[name].impl._pcp_prolog_uses_split_history
+        assert k.shape == (2, 128, 1, 512) and v.shape == (2, 128, 1, 64)
+        assert k.is_contiguous() and v.is_contiguous()
+        assert k.untyped_storage().data_ptr() != v.untyped_storage().data_ptr()
+
+    # Reuse the same layer instances: an ineligible neighbour/alias or a
+    # different configuration must not leave a stale split-writer flag.
+    if blocker == "mixed_writer":
+        layers[names[-1]].impl._prolog_v3_weights = None
+    elif blocker == "shared_consumer":
+        shared["borrower"] = names[0]
+    elif blocker == "dcp":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif blocker == "kv_transfer":
+        config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeConnectorV2")
+    else:
+        spec = replace(spec, page_size_padded=spec.page_size_bytes + 512)
+    cache = allocate()
+    for name in names:
+        k, v = cache[name]
+        assert not layers[name].impl._pcp_prolog_uses_split_history
+        assert not k.is_contiguous() and not v.is_contiguous()
+        assert k.untyped_storage().data_ptr() == v.untyped_storage().data_ptr()
 
 
 def test_v2_zeroer_constructs_component_zeroers(monkeypatch):

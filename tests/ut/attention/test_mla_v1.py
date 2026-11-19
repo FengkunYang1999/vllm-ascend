@@ -294,6 +294,7 @@ def test_mla_fused_preprocess_checks_weight_support(quant_method, device_type, e
 def test_mla_nz_management_respects_hardware_profile(device_type, enable_mlapo, fa_quant_layer, scheme_type):
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
     impl.use_flashmla = False
+    impl.use_pcp = False
     impl.dcp_q_replicate_enabled = False
     profile = get_hardware_profile(device_type)
     impl.support_fp8_attention = profile.supports(HardwareCapability.FP8_ATTENTION)
@@ -342,6 +343,7 @@ def test_mla_nz_management_respects_hardware_profile(device_type, enable_mlapo, 
 def test_mla_dynamic_int8_weight_whitelist(device_type, scheme_type, expected_enabled):
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
     impl.use_flashmla = False
+    impl.use_pcp = False
     impl.dcp_q_replicate_enabled = False
     profile = get_hardware_profile(device_type)
     impl.support_fp8_attention = profile.supports(HardwareCapability.FP8_ATTENTION)
@@ -1515,12 +1517,25 @@ class TestAscendMLAMetadataBuilderBuild(TestBase):
                     side_effect=AssertionError("DCP-only override must not run without DCP"),
                 ),
                 patch.object(builder, "build_prefill_metadata", return_value=MagicMock()),
+                patch(
+                    "vllm_ascend.attention.mla_v1.get_pcp_group",
+                    return_value=SimpleNamespace(world_size=pcp_size, rank_in_group=0),
+                ),
             ):
                 self.mock_vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
                 builder.pcp_size = pcp_size
                 builder.use_pcp = pcp_size > 1
-                common_attn_metadata.pcp_context = SimpleNamespace() if pcp_size > 1 else None
+                builder.is_pcp_decode_sharded = pcp_size > 1
+                common_attn_metadata.pcp_context = (
+                    SimpleNamespace(
+                        global_batch=SimpleNamespace(is_prefilling_np=common_attn_metadata.is_prefilling.numpy())
+                    )
+                    if pcp_size > 1
+                    else None
+                )
                 common_attn_metadata.slot_mapping = torch.arange(3 * pcp_size)
+                common_attn_metadata.positions = torch.full((3,), 10)
+                mock_get_cos_and_sin_mla.return_value = (torch.ones(3, 1, 1, 64), torch.ones(3, 1, 1, 64))
                 metadata = builder.build(0, common_attn_metadata)
                 expected_decodes = 3 if pcp_size == 1 else 0
                 self.assertEqual(metadata.num_decodes, expected_decodes)
@@ -3263,6 +3278,35 @@ class TestAscendMLAImpl(TestBase):
                 )
         mock_rope.assert_not_called()
         mock_rope_cache.assert_not_called()
+
+    def test_native_nope_prefill_preserves_rows_with_zero_width_rope(self):
+        self.impl.use_pcp = False
+        self.impl.use_mla_rope = True
+        self.impl.num_heads = self.impl.num_kv_heads = self.impl.q_projection_heads = 1
+        self.impl.qk_head_dim = self.impl.qk_nope_head_dim = self.impl.kv_lora_rank = self.impl.v_head_dim = 2
+        self.impl.qk_rope_head_dim = 0
+        self.impl.q_proj.side_effect = lambda q: (q,)
+        self.impl.kv_a_layernorm = torch.nn.Identity()
+        self.impl.kv_b_proj.side_effect = lambda latent: (torch.cat((latent, -latent), dim=-1),)
+
+        q = torch.arange(8, dtype=torch.float32).view(4, 2)
+        latent = q + 10
+        cache = torch.full((1, 4, 1, 2), -1.0)
+        empty_rope = torch.empty(4, 0)
+        metadata = SimpleNamespace(
+            num_decode_tokens=1,
+            num_actual_tokens=3,
+            slot_mapping=torch.tensor([3, 2, 0, -1]),
+            prefill=SimpleNamespace(cos=empty_rope, sin=empty_rope),
+        )
+        result = self.impl.mla_preprocess_prefill(q, latent, (cache, torch.empty(1, 4, 1, 0)), metadata)
+
+        torch.testing.assert_close(result.q_nope[:, 0], q[1:3])
+        torch.testing.assert_close(result.k_nope[:, 0], latent[1:3])
+        torch.testing.assert_close(result.value[:, 0], -latent[1:3])
+        assert result.q_pe.shape == result.k_pe.shape == (2, 1, 0)
+        torch.testing.assert_close(cache[0, [2, 0], 0], latent[1:3])
+        assert torch.all(cache[0, [1, 3]] == -1)
 
     @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_kv_rmsnorm_rope_cache", create=True)
     def test_exec_kv_prefill(self, mock_kv_rmsnorm_rope_cache):
