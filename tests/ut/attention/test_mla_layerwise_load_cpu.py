@@ -144,6 +144,8 @@ def make_forward(path, batch, wait):
     impl = SimpleNamespace(
         layer_name="language_model.model.layers.3.self_attn.attn",
         num_heads=1,
+        q_projection_heads=1,
+        dcp_q_replicate_enabled=False,
         num_kv_heads=1,
         v_head_dim=2,
         kv_lora_rank=2,

@@ -80,8 +80,8 @@ def supports_strided_mla_cache(
 ) -> bool:
     """Share the writer contract between post-load weights and cache allocation.
 
-    Attention post-load hooks see upstream MLA specs before the runners add
-    Ascend layout metadata, so inspect the geometry and layer markers directly.
+    Cache owners publish their selected format before allocation. Also check
+    the prepared writer workspace before committing to a strided history layout.
     """
     if not isinstance(attn_module, MLAAttention) or not isinstance(
         kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
@@ -100,7 +100,9 @@ def supports_strided_mla_cache(
         return False
     impl = getattr(attn_module, "impl", None)
     if getattr(impl, "use_pcp", False) or getattr(impl, "is_pcp_decode_sharded", False):
-        return False
+        buffers_are_sufficient = getattr(impl, "_pcp_prolog_v3_buffers_are_sufficient", None)
+        if buffers_are_sufficient is None or not buffers_are_sufficient():
+            return False
     if getattr(impl, "use_dcp", False):
         buffers_are_sufficient = getattr(impl, "_dcp_current_kv_buffers_are_sufficient", None)
         if buffers_are_sufficient is None or getattr(impl, "_dcp_current_kv_buffers", None) is None:

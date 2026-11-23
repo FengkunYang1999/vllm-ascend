@@ -324,12 +324,11 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
-        # PCP cannot consume the RoPE PROLOG_V3 workspaces. The legacy no-rope
-        # MLAPO decode buffer still has a consumer with PCP enabled.
         if self.use_dcp and (
-            (self.supports_prolog_v3_writer() and not self.use_pcp and not self.is_pcp_decode_sharded)
+            self.supports_prolog_v3_writer()
             or (self.enable_mlapo and not self.fa_quant_layer and not self.use_mla_rope and not self.enable_kv_nz)
         ):
+            # Replicated decode and draft steps without a PCP plan still use DCP workspaces.
             self._prepare_dcp_current_kv_buffers()
         if self.use_dcp:
             # The shared writer contract checks these workspaces. Prepare the
