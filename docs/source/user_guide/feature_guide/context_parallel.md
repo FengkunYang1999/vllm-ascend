@@ -66,6 +66,14 @@ When PCP size is greater than 1, PCP stores embedding and LM Head weights as TPÃ
 
 With PCP enabled, O-projection weight sharding is on by default for SFA-PCP O-projection and DSA-PCP two-stage O-projection (`wo_a`/`wo_b`). If the weight method or PCP partition does not support sharding, the option is disabled with a warning. Set `enable_pcp_o_proj_weight_sharding` to `false` to disable it. Other attention backends do not use this option. O-projection sharding is incompatible with fine-grained TP for the same modules.
 
+For native MLA attention, PCP automatically uses fused PrologV3 preprocessing
+when the layer's projections, BF16 activations, and KV cache support it. This
+also applies when PCP and DCP are combined. Static W8A8 projections retain
+the existing preprocessing path to preserve their activation scales and bias
+compensation. No additional option is required; unsupported layers keep their
+existing path. This optimization does not enable PCP with the external
+FlashMLA backend.
+
 #### Speculative Decoding
 
 PCP supports MTP with MLA, SFA, and DeepSeek-V4 DSA models, Eagle3 with

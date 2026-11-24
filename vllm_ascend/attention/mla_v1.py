@@ -86,6 +86,7 @@ from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
     ACL_FORMAT_FRACTAL_NZ,
     enable_sfa,
+    is_internal_npu_format,
     is_pd_decode_recompute_scheduler_enabled,
     maybe_trans_nz,
     vllm_version_is,
@@ -288,6 +289,15 @@ class AscendMLADecodeMetadata:
 
 
 @dataclass
+class PCPMLAPrologMetadata:
+    """Cache publication order for one rank's padded Prolog input."""
+
+    local_slots: torch.Tensor
+    global_slots: torch.Tensor
+    num_replicated_tokens: int
+
+
+@dataclass
 class AscendMLAMetadata:
     """Metadata for MLACommon.
     NOTE: Please read the comment at the top of the file before trying to
@@ -330,11 +340,12 @@ class AscendMLAMetadata:
     prefill: AscendMLAPrefillMetadata | None = None
     reshape_cache_event: torch.npu.Event = None
     # RoPE of every rank-local input token, including padding, for the
-    # sharded-decode PCP KV gather.
+    # PCP writer and the legacy sharded-decode KV gather.
     pcp_cos: torch.Tensor | None = None
     pcp_sin: torch.Tensor | None = None
     # Resolved by the builder; execution must not infer layout from tensor sizes.
     uses_pcp_sharded_layout: bool = False
+    pcp_prolog: PCPMLAPrologMetadata | None = None
     external_flashmla: FlashMLADecode | None = None
 
     def __post_init__(self):
@@ -408,6 +419,13 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         static_forward_context = vllm_config.compilation_config.static_forward_context
         # MLA layers are grouped by RoPE mode before metadata builders are created.
         self.use_mla_rope = static_forward_context[layer_names[0]].impl.use_mla_rope if layer_names else True
+        # Builders precede cache allocation. Resolve the actual writer layout
+        # from these layers at build time, after their caches have been bound.
+        self._pcp_prolog_layers = tuple(
+            static_forward_context[name]
+            for name in layer_names
+            if getattr(static_forward_context[name].impl, "_pcp_prolog_v3_buffers", None) is not None
+        )
         self.cos_cache = None
         self.sin_cache = None
 
@@ -675,13 +693,45 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         )
         if pcp_shard_slot_mapping is not None:
             self._finalize_pcp_metadata(metadata, pcp_shard_slot_mapping)
-            if self.is_pcp_decode_sharded:
+            self._build_pcp_prolog_metadata(metadata, common_attn_metadata)
+            if self.is_pcp_decode_sharded or metadata.pcp_prolog is not None:
                 # Decode rows lead the local positions, so a decode-only batch
                 # can refresh the graph-stable RoPE buffer that decode uses.
                 metadata.pcp_cos, metadata.pcp_sin = get_cos_and_sin_mla(
                     common_attn_metadata.positions.long(), use_cache=self.num_prefills == 0
                 )
         return metadata
+
+    def _build_pcp_prolog_metadata(
+        self,
+        metadata: AscendMLAMetadata,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> None:
+        if (
+            not self.use_mla_rope
+            or self.rope_dim == 0
+            or not any(layer.impl._uses_pcp_prolog_v3(layer.kv_cache) for layer in self._pcp_prolog_layers)
+        ):
+            return
+        context = common_attn_metadata.pcp_context
+        has_global_prefill = context is not None and context.global_batch.is_prefilling_np.any()
+        if not metadata.uses_pcp_sharded_layout or not (
+            self.is_pcp_decode_sharded or metadata.num_prefills > 0 or has_global_prefill
+        ):
+            return
+        group = get_pcp_group()
+        rank_slots = metadata.slot_mapping.view(group.world_size, -1)
+        replicated = get_pcp_num_replicated_tokens(metadata.num_decode_tokens, self.is_pcp_decode_sharded)
+        local_slots = rank_slots[group.rank_in_group]
+        if replicated and group.rank_in_group != 0:
+            # Only rank 0 carries slots for replicated decode in the expanded
+            # mapping, but every PCP rank keeps that prefix in its own cache.
+            local_slots = torch.cat((rank_slots[0, :replicated], local_slots[replicated:]))
+        metadata.pcp_prolog = PCPMLAPrologMetadata(
+            local_slots=local_slots.contiguous(),
+            global_slots=rank_slots[:, replicated:].reshape(-1),
+            num_replicated_tokens=replicated,
+        )
 
     def _finalize_pcp_metadata(
         self,
@@ -1094,6 +1144,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         self._mlapo_uses_native_weights = False
         self.use_flashmla: bool = self._can_use_flashmla()
         self._flashmla_writer_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._pcp_prolog_v3_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        # Set by the V2 allocator only when this layer actually receives split history.
+        self._pcp_prolog_uses_split_history = False
 
     def _can_use_flashmla(self) -> bool:
         config = self.vllm_config
@@ -1373,6 +1426,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             # if mlapo, W_UK_T can't trans nz
             self.W_UK_T = maybe_trans_nz(self.W_UK_T)
+        self._prepare_pcp_prolog_v3_buffers()
         if getattr(self, "_prolog_v3_weights", None) is not None:
             # RL weight updates can call this method after ACL graph capture.
             # Refresh the private PROLOG_V3 projection cache in place so the
@@ -1384,6 +1438,39 @@ class AscendMLAImpl(MLAAttentionImpl):
         self._prepare_strided_kv_workspace()
         if self.use_flashmla and self.supports_prolog_v3_writer():
             self._prepare_flashmla_writer_buffers()
+
+    def _required_pcp_prolog_v3_capacity(self) -> int:
+        config = self.vllm_config
+        return max(
+            config.scheduler_config.max_num_batched_tokens,
+            max(config.compilation_config.cudagraph_capture_sizes or [0]),
+        )
+
+    def _prepare_pcp_prolog_v3_buffers(self) -> None:
+        """Profile a stable full local chunk before allocating history KV."""
+        if (
+            not self.use_pcp
+            or not self.supports_prolog_v3_writer()
+            or not supports_component_major_mla_pd(self.vllm_config)
+        ):
+            return
+        if getattr(self, "_pcp_prolog_v3_buffers", None) is not None:
+            return
+        capacity = self._required_pcp_prolog_v3_capacity()
+        # Match DCP: current KV uses kernel pages, not scheduler logical blocks.
+        block_size = AscendMLABackend.get_supported_kernel_block_sizes()[0]
+        shape = (cdiv(capacity, block_size), block_size, self.num_kv_heads)
+        # Post-load may release the unfused A weight; W_UV stays on the layer's device.
+        device = self.W_UV.device
+        self._pcp_prolog_v3_buffers = (
+            torch.empty((*shape, self.kv_lora_rank), dtype=self.dtype, device=device),
+            torch.empty((*shape, self.qk_rope_head_dim), dtype=self.dtype, device=device),
+            torch.arange(capacity, dtype=torch.int64, device=device),
+        )
+
+    def _pcp_prolog_v3_buffers_are_sufficient(self) -> bool:
+        buffers = getattr(self, "_pcp_prolog_v3_buffers", None)
+        return buffers is not None and self._required_pcp_prolog_v3_capacity() <= buffers[2].numel()
 
     def _prepare_flashmla_writer_buffers(self) -> None:
         """Keep a bounded dense PROLOG workspace alive across graph replay."""
@@ -1433,6 +1520,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         if not isinstance(attn_module, MLAAttention):
             return
         cache_spec = attn_module.get_kv_cache_spec(config)
+        # This checks writer capability, not the final history layout. PCP may
+        # write private pages and publish into split history chosen after load.
         if supports_strided_mla_cache(config, attn_module, cache_spec):
             self._prepare_prolog_v3_weights()
 
@@ -1899,6 +1988,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         q_quant_type = type(self._get_context_prolog_quant_method(self.q_proj))
         if fused_quant_type != q_quant_type:
             return False
+        if self.use_pcp and fused_quant_type is AscendW8A8LinearMethod:
+            # Static W8A8 carries activation offsets and projection/norm bias
+            # compensation that this Prolog contract cannot preserve. Keep
+            # PCP on its native path without changing non-PCP admission.
+            return False
         return fused_quant_type in (
             type(None),
             AscendW8A8LinearMethod,
@@ -2097,6 +2191,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         fused_weight = self.fused_qkv_a_proj.weight.data
         weight_uq_qr = self.q_proj.weight.data
+
+        # Materialize projection views in ND: some NPU stacks cannot clone
+        # internal-format views. The prepared weights are packed into NZ below.
+        if is_internal_npu_format(fused_weight):
+            fused_weight = torch_npu.npu_format_cast(fused_weight, ACL_FORMAT_FRACTAL_ND)
+        if is_internal_npu_format(weight_uq_qr):
+            weight_uq_qr = torch_npu.npu_format_cast(weight_uq_qr, ACL_FORMAT_FRACTAL_ND)
+
         weight_uk = self.mlapo_W_UK_T
         prolog_num_heads = getattr(self, "num_heads", weight_uk.shape[0])
         if quant_type is None:
@@ -2319,6 +2421,34 @@ class AscendMLAImpl(MLAAttentionImpl):
             return False
         return True
 
+    def _matches_pcp_split_history(self, kv_cache: tuple[torch.Tensor, ...]) -> bool:
+        # The public cache is the scatter destination, not Prolog's writer cache.
+        # Its two contiguous components have different page strides by design.
+        if not self._pcp_prolog_uses_split_history or len(kv_cache) != 2:
+            return False
+        nope, rope = kv_cache
+        return (
+            nope.ndim == rope.ndim == 4
+            and nope.shape[:3] == rope.shape[:3]
+            and nope.shape[1] > 0
+            and nope.shape[2:] == (1, self.kv_lora_rank)
+            and rope.shape[-1] == self.qk_rope_head_dim
+            and nope.dtype == rope.dtype == torch.bfloat16
+            and nope.device == rope.device
+            and nope.is_contiguous()
+            and rope.is_contiguous()
+        )
+
+    def _uses_pcp_prolog_v3(self, kv_cache: torch.Tensor | tuple[torch.Tensor, ...]) -> bool:
+        """Share actual PCP writer admission with metadata construction."""
+        return (
+            self.use_pcp
+            and isinstance(kv_cache, tuple)
+            and self.supports_prolog_v3_writer()
+            and self._pcp_prolog_v3_buffers_are_sufficient()
+            and (self._matches_pcp_split_history(kv_cache) or self._cache_requires_prolog_v3_writer(kv_cache))
+        )
+
     @staticmethod
     def _flatten_prolog_rope_table(table: torch.Tensor, num_tokens: int) -> torch.Tensor:
         if table.dim() < 2:
@@ -2448,7 +2578,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert dcp_current_kv_buffers is not None
         current_nope_cache, current_pe_cache, current_indices = dcp_current_kv_buffers
         assert num_tokens <= current_indices.numel()
-        block_size = kv_cache[0].shape[1]
+        # Count pages in the private writer cache; history may use a different page size.
+        block_size = current_nope_cache.shape[1]
         num_current_blocks = cdiv(num_tokens, block_size)
         current_nope_cache = current_nope_cache[:num_current_blocks]
         current_pe_cache = current_pe_cache[:num_current_blocks]
@@ -2459,14 +2590,62 @@ class AscendMLAImpl(MLAAttentionImpl):
             current_pe_cache.flatten(0, 1)[:num_tokens],
         )
 
+    def _prepare_pcp_prolog_v3(self, hidden_states, attn_metadata: AscendMLAMetadata, plan: PCPMLAPrologMetadata):
+        """Use one padded input per PCP rank, even when this rank has no actual queries."""
+        n = plan.local_slots.numel()
+        cos, sin = attn_metadata.pcp_cos, attn_metadata.pcp_sin
+        if (
+            hidden_states.shape[0] != n
+            or cos is None
+            or sin is None
+            or cos.shape[0] != n
+            or sin.shape[0] != n
+            or not 0 <= attn_metadata.num_decode_tokens <= attn_metadata.num_actual_tokens <= n
+        ):
+            raise RuntimeError("PCP Prolog requires matching padded inputs, RoPE tables and local token counts.")
+        if n == 0:
+            return None
+        buffers = self._pcp_prolog_v3_buffers
+        if buffers is None or n > buffers[2].numel():
+            raise RuntimeError("PCP Prolog input exceeds the profiled current-KV workspace.")
+        nope, rope, linear_slots = buffers
+        blocks = cdiv(n, nope.shape[1])
+        return hidden_states, cos, sin, (nope[:blocks], rope[:blocks]), linear_slots[:n]
+
+    @staticmethod
+    def _publish_pcp_prolog_kv(plan: PCPMLAPrologMetadata, prolog_cache, kv_cache):
+        """Publish owned history rows; return full local current KV for both attention phases."""
+        n, prefix = plan.local_slots.numel(), plan.num_replicated_tokens
+        nope, rope = (cache.flatten(0, 1)[:n] for cache in prolog_cache)
+        if prefix:
+            DeviceOperator.reshape_and_cache(
+                key=nope[:prefix],
+                value=rope[:prefix],
+                key_cache=kv_cache[0],
+                value_cache=kv_cache[1],
+                slot_mapping=plan.local_slots[:prefix],
+            )
+        if plan.global_slots.numel():
+            # Only the suffix is sharded. History ownership (-1) must not mask local current KV.
+            packed = torch.cat((nope[prefix:], rope[prefix:]), dim=-1)
+            gathered = get_pcp_group().all_gather(packed, dim=0)
+            global_nope, global_rope = gathered.split((nope.shape[-1], rope.shape[-1]), dim=-1)
+            DeviceOperator.reshape_and_cache(
+                key=global_nope.contiguous(),
+                value=global_rope.contiguous(),
+                key_cache=kv_cache[0],
+                value_cache=kv_cache[1],
+                slot_mapping=plan.global_slots,
+            )
+        return nope, rope
+
     def mla_preprocess_prolog_v3(self, hidden_states, kv_cache, attn_metadata):
         """Use PROLOG_V3 for both decode and prefill MLA preprocessing.
 
-        This path is selected only for strided MLA caches.  It lets PROLOG_V3
-        own Q projection, KV RMSNorm, RoPE, and the cache write, avoiding the
-        ``AutoContiguous`` copy in ``aclnnKvRmsNormRopeCache``.  DCP keeps the
-        complete current chunk in a private workspace and scatters only its
-        rank-owned rows into the strided history cache.
+        For strided history, PROLOG_V3 avoids the AutoContiguous copy in the
+        legacy writer. With a PCP plan it writes private pages instead; the
+        publish step scatters into the actual history layout. DCP preserves
+        the complete current chunk while storing only its owned history rows.
         """
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -2482,10 +2661,21 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self.layerwise_kv_cache_hook is not None:
             self.layerwise_kv_cache_hook.wait_for_layer(self.layer_name)
 
-        if num_decode_tokens > 0:
+        pcp_plan = attn_metadata.pcp_prolog if self.use_pcp else None
+        pcp_current_kv = None
+        current_k_nope = current_k_pe = None
+        if pcp_plan is not None:
+            # Reuse the first launch for the whole PCP span. A padded rank with no
+            # decode (or no local query at all) must still participate in KV publication.
+            pcp_inputs = self._prepare_pcp_prolog_v3(hidden_states, attn_metadata, pcp_plan)
+            if pcp_inputs is None:
+                return None, None
+            prolog_hidden, prolog_cos, prolog_sin, prolog_cache, prolog_slots = pcp_inputs
+        elif num_decode_tokens > 0:
+            prolog_hidden = hidden_states[:num_decode_tokens]
+            prolog_cos, prolog_sin = attn_metadata.decode.cos, attn_metadata.decode.sin
             flash = attn_metadata.external_flashmla
             history_slots = flash.slots if flash is not None else attn_metadata.slot_mapping[:num_decode_tokens]
-            current_k_nope = current_k_pe = None
             if decode_requires_current_kv:
                 # DCP split attention needs the complete current chunk while the
                 # paged cache keeps only this rank's history rows. Write the
@@ -2498,23 +2688,27 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prolog_cache = kv_cache
                 prolog_slots = history_slots
 
+        if num_decode_tokens > 0 or pcp_plan is not None:
             prolog_outputs = self._run_prolog_v3(
-                hidden_states[:num_decode_tokens],
-                attn_metadata.decode.cos,
-                attn_metadata.decode.sin,
-                prolog_cache,
-                prolog_slots,
-                quantize_query=True,
+                prolog_hidden, prolog_cos, prolog_sin, prolog_cache, prolog_slots, quantize_query=pcp_plan is None
             )
+            if pcp_plan is not None:
+                # Finish the PCP collective before DCP reorganizes any decode Q.
+                pcp_current_kv = self._publish_pcp_prolog_kv(pcp_plan, prolog_cache, kv_cache)
+
+        if num_decode_tokens > 0:
             decode_q_nope, decode_q_pe, decode_dequant_scale = prolog_outputs[:3]
             prolog_num_heads = self._prolog_v3_weights["num_heads"]
-            decode_q_nope = decode_q_nope.view(num_decode_tokens, prolog_num_heads, self.kv_lora_rank)
-            decode_q_pe = decode_q_pe.view(num_decode_tokens, prolog_num_heads, self.qk_rope_head_dim)
+            n = prolog_hidden.shape[0]
+            decode_q_nope = decode_q_nope.view(n, prolog_num_heads, self.kv_lora_rank)[:num_decode_tokens]
+            decode_q_pe = decode_q_pe.view(n, prolog_num_heads, self.qk_rope_head_dim)[:num_decode_tokens]
             if prolog_num_heads > self.num_heads:
                 decode_q_nope = decode_q_nope[:, : self.num_heads]
                 decode_q_pe = decode_q_pe[:, : self.num_heads]
             decode_q_nope, decode_q_pe = self.reorg_decode_q(decode_q_nope, decode_q_pe)
-            if decode_requires_current_kv:
+            if decode_requires_current_kv and pcp_current_kv is not None:
+                current_k_nope, current_k_pe = (kv[:num_decode_tokens] for kv in pcp_current_kv)
+            elif decode_requires_current_kv:
                 DeviceOperator.reshape_and_cache(
                     key=current_k_nope,
                     value=current_k_pe,
@@ -2535,7 +2729,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         if num_actual_tokens > num_decode_tokens:
             if attn_metadata.prefill is None or attn_metadata.prefill.cos is None or attn_metadata.prefill.sin is None:
                 raise RuntimeError("PROLOG_V3 prefill requires prefill cos/sin tables.")
-            prefill_slots = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
             num_prefill_tokens = num_actual_tokens - num_decode_tokens
             # Metadata can include graph padding beyond the actual prefill rows.
             prefill_cos = attn_metadata.prefill.cos[:num_prefill_tokens]
@@ -2546,14 +2739,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             # (qk_nope_head_dim), so keep the original query projection here.
             assert self.fused_qkv_a_proj is not None
             assert self.q_a_layernorm is not None
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            qkv_lora = self.fused_qkv_a_proj(
+                hidden_states[:num_actual_tokens] if pcp_current_kv is not None else hidden_states
+            )[0]
             q_c, _ = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
             prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
-            prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+            # A DCP replicated projection returns group heads; prefill consumes only local heads.
+            prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.q_projection_heads, self.qk_head_dim)
+            if self.dcp_q_replicate_enabled:
+                prefill_q = self.q_proj._local_view(prefill_q)
             prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             prefill_q_pe = self.rope_single(
@@ -2562,41 +2760,49 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_sin,
             )
 
-            if prefill_requires_current_kv:
-                # DCP slot mappings use -1 for real current rows owned by
-                # another rank. Keep the complete chunk in the private
-                # workspace, then scatter only this rank's owned rows.
-                (
+            if pcp_current_kv is not None:
+                # The first launch already wrote these rows. Use local current KV,
+                # including real rows for which this rank has no history slot.
+                prefill_current_k_nope, prefill_current_k_pe = (
+                    kv[num_decode_tokens:num_actual_tokens] for kv in pcp_current_kv
+                )
+            else:
+                prefill_slots = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+                if prefill_requires_current_kv:
+                    # DCP slot mappings use -1 for real current rows owned by
+                    # another rank. Keep the complete chunk in the private
+                    # workspace, then scatter only this rank's owned rows.
+                    (
+                        prolog_cache,
+                        prolog_slots,
+                        prefill_current_k_nope,
+                        prefill_current_k_pe,
+                    ) = self._get_dcp_current_kv_workspace(num_prefill_tokens, kv_cache, prefill=True)
+                else:
+                    prolog_cache = kv_cache
+                    prolog_slots = prefill_slots
+
+                prolog_outputs = self._run_prolog_v3(
+                    hidden_states[num_decode_tokens:num_actual_tokens],
+                    prefill_cos,
+                    prefill_sin,
                     prolog_cache,
                     prolog_slots,
-                    prefill_current_k_nope,
-                    prefill_current_k_pe,
-                ) = self._get_dcp_current_kv_workspace(num_prefill_tokens, kv_cache, prefill=True)
-            else:
-                prolog_cache = kv_cache
-                prolog_slots = prefill_slots
-
-            prolog_outputs = self._run_prolog_v3(
-                hidden_states[num_decode_tokens:num_actual_tokens],
-                prefill_cos,
-                prefill_sin,
-                prolog_cache,
-                prolog_slots,
-                quantize_query=False,
-            )
-
-            if prefill_requires_current_kv:
-                DeviceOperator.reshape_and_cache(
-                    key=prefill_current_k_nope,
-                    value=prefill_current_k_pe,
-                    key_cache=kv_cache[0],
-                    value_cache=kv_cache[1],
-                    slot_mapping=prefill_slots,
+                    quantize_query=False,
                 )
-            else:
-                prefill_current_k_nope, prefill_current_k_pe = self._gather_current_kv_from_cache(
-                    kv_cache, prefill_slots
-                )
+
+                if prefill_requires_current_kv:
+                    DeviceOperator.reshape_and_cache(
+                        key=prefill_current_k_nope,
+                        value=prefill_current_k_pe,
+                        key_cache=kv_cache[0],
+                        value_cache=kv_cache[1],
+                        slot_mapping=prefill_slots,
+                    )
+                else:
+                    prefill_current_k_nope, prefill_current_k_pe = self._gather_current_kv_from_cache(
+                        kv_cache, prefill_slots
+                    )
             if self.fa_quant_layer and self.support_fp8_attention:
                 prefill_current_k_nope = torch.mul(
                     prefill_current_k_nope.to(self.fak_descale_float.dtype), self.fak_descale_float
@@ -2615,7 +2821,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_value,
             )
 
-        if num_decode_tokens > 0 or num_actual_tokens > num_decode_tokens:
+        if num_actual_tokens > 0 or pcp_current_kv is not None:
             notify_kv_cache_written(self.layer_name)
         return decode_result, prefill_result
 
@@ -3444,27 +3650,31 @@ class AscendMLAImpl(MLAAttentionImpl):
         dcp_current_kv_buffers = getattr(self, "_dcp_current_kv_buffers", None)
         dcp_prefill_current_kv_buffers = getattr(self, "_dcp_prefill_current_kv_buffers", None)
         num_prefill_tokens = max(num_actual_tokens - num_decode_tokens, 0)
-        use_prolog_v3_strided_cache = (
-            self._cache_requires_prolog_v3_writer(kv_cache)
-            and not self.use_pcp
-            and not self.is_pcp_decode_sharded
-            and (not decode_requires_current_kv or self.use_dcp)
-            and (not prefill_requires_current_kv or self.use_dcp)
-            and (
-                not self.use_dcp
-                or (
-                    dcp_current_kv_buffers is not None
-                    and num_decode_tokens <= dcp_current_kv_buffers[2].numel()
-                    and (
-                        not prefill_requires_current_kv
-                        or (
-                            dcp_prefill_current_kv_buffers is not None
-                            and num_prefill_tokens <= dcp_prefill_current_kv_buffers[2].numel()
+        if self.use_pcp and attn_metadata.pcp_prolog is not None:
+            # A PCP plan uses its full-batch workspace instead of the phase-local DCP buffers.
+            use_prolog_v3 = self._uses_pcp_prolog_v3(kv_cache) and (
+                attn_metadata.pcp_prolog.local_slots.numel() <= self._pcp_prolog_v3_buffers[2].numel()
+            )
+        else:
+            prolog_buffers_ready = (
+                (not decode_requires_current_kv or self.use_dcp)
+                and (not prefill_requires_current_kv or self.use_dcp)
+                and (
+                    not self.use_dcp
+                    or (
+                        dcp_current_kv_buffers is not None
+                        and num_decode_tokens <= dcp_current_kv_buffers[2].numel()
+                        and (
+                            not prefill_requires_current_kv
+                            or (
+                                dcp_prefill_current_kv_buffers is not None
+                                and num_prefill_tokens <= dcp_prefill_current_kv_buffers[2].numel()
+                            )
                         )
                     )
                 )
             )
-        )
+            use_prolog_v3 = self._cache_requires_prolog_v3_writer(kv_cache) and prolog_buffers_ready
         can_use_dcp_prolog = (
             self.enable_mlapo
             and not self.fa_quant_layer
@@ -3472,7 +3682,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             and not self.enable_kv_nz
             and attn_metadata.num_decode_tokens > 0
         )
-        if use_prolog_v3_strided_cache:
+        if use_prolog_v3:
             decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_prolog_v3(
                 hidden_states, kv_cache, attn_metadata
             )
