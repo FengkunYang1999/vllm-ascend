@@ -6,3 +6,7 @@ entries:
       BF16 activations when --prefill-context-parallel-size is greater than 1,
       including configurations that also enable decode context parallelism.
       Static W8A8 layers retain their existing preprocessing path.
+  - category: bugfix
+    text: >-
+      Fixed MLA PrologV3 weight preparation failing with an unsupported
+      internal-format clone error on A5 when projection weights use NZ storage.

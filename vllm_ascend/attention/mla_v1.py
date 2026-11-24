@@ -86,6 +86,7 @@ from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
     ACL_FORMAT_FRACTAL_NZ,
     enable_sfa,
+    is_internal_npu_format,
     is_pd_decode_recompute_scheduler_enabled,
     maybe_trans_nz,
     vllm_version_is,
@@ -2190,6 +2191,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         fused_weight = self.fused_qkv_a_proj.weight.data
         weight_uq_qr = self.q_proj.weight.data
+
+        # Materialize projection views in ND: some NPU stacks cannot clone
+        # internal-format views. The prepared weights are packed into NZ below.
+        if is_internal_npu_format(fused_weight):
+            fused_weight = torch_npu.npu_format_cast(fused_weight, ACL_FORMAT_FRACTAL_ND)
+        if is_internal_npu_format(weight_uq_qr):
+            weight_uq_qr = torch_npu.npu_format_cast(weight_uq_qr, ACL_FORMAT_FRACTAL_ND)
+
         weight_uk = self.mlapo_W_UK_T
         prolog_num_heads = getattr(self, "num_heads", weight_uk.shape[0])
         if quant_type is None:

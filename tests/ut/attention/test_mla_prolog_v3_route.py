@@ -26,6 +26,7 @@ from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
     AscendW8A8FP8DynamicLinearMethod,
     AscendW8A8LinearMethod,
+    AscendW8A8MXFP8DynamicLinearMethod,
 )
 from vllm_ascend.utils import enable_sfa
 
@@ -644,6 +645,95 @@ def test_prolog_v3_weights_keep_int8_dynamic_scale_layout_on_a5(monkeypatch):
     assert prepared["dequant_scale_w_dq"].shape == (1, impl.q_lora_rank)
     assert prepared["dequant_scale_w_dkv_kr"].shape == (1, FUSED_DIM)
     assert prepared["dequant_scale_w_uq_qr"].shape == (1, q_output_dim)
+
+
+@pytest.mark.parametrize("use_pcp", [False, True])
+@pytest.mark.parametrize(
+    "internal_sources", [(False, False), (True, False), (False, True), (True, True)], ids=["dense", "a", "qb", "both"]
+)
+@pytest.mark.parametrize(
+    "quant_type,dtype",
+    [
+        (None, torch.bfloat16),
+        (AscendW8A8LinearMethod, torch.int8),
+        (AscendW8A8DynamicLinearMethod, torch.int8),
+        (AscendW8A8MXFP8DynamicLinearMethod, torch.float8_e4m3fn),
+    ],
+    ids=["native", "static-int8", "dynamic-int8", "mxfp8"],
+)
+def test_prolog_weights_normalize_internal_sources_before_materialization(
+    monkeypatch, use_pcp, internal_sources, quant_type, dtype
+):
+    """Exercise shared preparation, independently of each scheme's writer admission."""
+    impl = _make_post_load_impl(monkeypatch)
+    impl.use_pcp = use_pcp
+    impl.mlapo_W_UK_T = torch.zeros(impl.num_heads, impl.qk_nope_head_dim, impl.kv_lora_rank)
+    quant_method = None if quant_type is None else object.__new__(quant_type)
+    impl._get_context_prolog_quant_method = lambda _layer: quant_method
+
+    class InternalWeight(torch.Tensor):
+        def contiguous(self, *args, **kwargs):
+            raise RuntimeError("Internal-format weights must be converted to ND before materialization.")
+
+    source_layouts = {}
+
+    def format_cast(tensor, target_format):
+        if target_format == mla_v1.ACL_FORMAT_FRACTAL_ND:
+            # ND sources must not be converted. Internal sources must reach
+            # this boundary whole, before slicing or the native transpose.
+            assert isinstance(tensor, InternalWeight)
+            assert (tensor.shape, tensor.stride()) == source_layouts[tensor.data_ptr()]
+            return tensor.as_subclass(torch.Tensor).clone()
+        assert target_format == mla_v1.ACL_FORMAT_FRACTAL_NZ
+        assert not isinstance(tensor, InternalWeight)
+        return tensor.clone()
+
+    monkeypatch.setattr(mla_v1, "is_internal_npu_format", lambda tensor: isinstance(tensor, InternalWeight))
+    monkeypatch.setattr(torch_npu, "npu_format_cast", format_cast)
+    fused_dim = impl.q_lora_rank + impl.kv_lora_rank + impl.qk_rope_head_dim
+    q_dim = impl.num_heads * impl.qk_head_dim
+    fused_values = torch.arange(impl.q_lora_rank * fused_dim).reshape(impl.q_lora_rank, fused_dim) % 15 - 7
+    q_values = torch.arange(impl.q_lora_rank * q_dim).reshape(impl.q_lora_rank, q_dim) % 15 - 7
+    # Rebuild one internal INT8 case as well: reload must repeat normalization
+    # while retaining every graph-visible buffer allocated by the first build.
+    reload_weights = use_pcp and all(internal_sources) and quant_type is AscendW8A8DynamicLinearMethod
+    for generation in range(2 if reload_weights else 1):
+        logical_weights = [(values + generation).to(dtype) for values in (fused_values, q_values)]
+        sources = []
+        for projection, values, internal in zip(
+            (impl.fused_qkv_a_proj, impl.q_proj), logical_weights, internal_sources
+        ):
+            storage = values.T.contiguous() if quant_type is None else values
+            source = nn.Parameter(storage.as_subclass(InternalWeight) if internal else storage, requires_grad=False)
+            projection.weight = source
+            source_layouts[source.data_ptr()] = (source.shape, source.stride())
+            sources.append((projection, source, storage.clone(), source.data_ptr()))
+            output_dim = values.shape[1]
+            projection.weight_scale = (
+                torch.arange(output_dim * 2, dtype=torch.float32).reshape(1, output_dim, 2) + 1
+                if quant_type is AscendW8A8MXFP8DynamicLinearMethod
+                else torch.arange(output_dim, dtype=torch.float32) + 1
+            )
+
+        if generation == 0:
+            prepared = impl._prepare_prolog_v3_weights()
+            pointers = {name: value.data_ptr() for name, value in prepared.items() if isinstance(value, torch.Tensor)}
+        else:
+            impl._refresh_prolog_v3_weights()
+            assert impl._prolog_v3_weights is prepared
+            assert {name: prepared[name].data_ptr() for name in pointers} == pointers
+
+        expected_weights = {
+            "weight_dq": logical_weights[0][:, : impl.q_lora_rank],
+            "weight_dkv_kr": logical_weights[0][:, impl.q_lora_rank :],
+            "weight_uq_qr": logical_weights[1],
+        }
+        for name, expected in expected_weights.items():
+            assert prepared[name].dtype == dtype
+            torch.testing.assert_close(prepared[name].float(), expected.float(), rtol=0, atol=0)
+        for projection, source, original, pointer in sources:
+            assert projection.weight is source and source.data_ptr() == pointer
+            torch.testing.assert_close(source.as_subclass(torch.Tensor).float(), original.float(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
