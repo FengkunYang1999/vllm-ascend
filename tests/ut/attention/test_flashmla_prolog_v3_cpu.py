@@ -33,6 +33,62 @@ def load(path, name, scope, owner=None):
     return scope[name]
 
 
+@pytest.mark.parametrize(
+    ("input_offset", "quant_bias", "route", "probes"),
+    [
+        pytest.param(0, None, True, 0, id="no-bias"),
+        pytest.param(3, [-9, -6], True, 1, id="zero-point-cancelled"),
+        pytest.param(3, [-9, -4], False, 1, id="residual-on-kv-output"),
+    ],
+)
+def test_fia_prolog_writer_preserves_static_int8_projection_bias(input_offset, quant_bias, route, probes):
+    weight = torch.zeros(7168, 2, dtype=torch.int8)
+    weight[:2] = torch.tensor([[2, -1], [1, 3]], dtype=torch.int8)
+
+    # At zero input, a zero point of 3 contributes [9, 6] to the two accumulators.
+    def static_linear(layer, x, bias=None):
+        x_int = (x.float() / layer.input_scale).round().add(layer.input_offset).clamp(-128, 127).to(torch.int8)
+        accum = x_int.int() @ layer.weight.int()
+        if layer.quant_bias is not None:
+            accum = accum + layer.quant_bias
+        return (accum.float() * layer.deq_scale).to(x.dtype)
+
+    apply = Mock(side_effect=static_linear)
+    proj = SimpleNamespace(
+        input_size=weight.shape[0],
+        weight=weight,
+        input_scale=0.5,
+        input_offset=torch.tensor(input_offset, dtype=torch.int8),
+        deq_scale=torch.tensor([0.25, 0.5]),
+        quant_bias=None if quant_bias is None else torch.tensor(quant_bias, dtype=torch.int32),
+        bias=None,
+        skip_bias_add=False,
+        quant_method=SimpleNamespace(apply=apply),
+    )
+    impl = SimpleNamespace(
+        fused_qkv_a_proj=proj,
+        dtype=torch.bfloat16,
+        use_flashmla=False,
+        use_pcp=False,
+        is_pcp_decode_sharded=False,
+        _supports_strided_mla_projection=lambda: True,
+    )
+    scope = {"torch": torch}
+    for name in ("_check_prolog_v3_projection_bias", "supports_prolog_v3_writer"):
+        setattr(impl, name, MethodType(load(MLA, name, scope, "AscendMLAImpl"), impl))
+
+    impl._check_prolog_v3_projection_bias()
+    assert impl.supports_prolog_v3_writer() is route
+    assert apply.call_count == probes
+
+    if probes and route:
+        # The writer's cached projections and captured graphs already depend on this decision.
+        impl._prolog_v3_weights = {"weight_dq": weight}
+        proj.quant_bias[1] += 1
+        with pytest.raises(RuntimeError, match="rebuild"):
+            impl._check_prolog_v3_projection_bias()
+
+
 def scatter(*, key, value, key_cache, value_cache, slot_mapping):
     for row, slot in enumerate(slot_mapping.tolist()):
         if slot >= 0:
