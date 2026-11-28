@@ -1,0 +1,4 @@
+pr: 6
+entries:
+  - category: bugfix
+    text: Preserve MLA generation accuracy for checkpoints whose Q-A/KV-A projection has an effective bias when using the optional non-PCP FIA cache writer.
