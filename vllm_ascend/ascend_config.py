@@ -642,7 +642,6 @@ class AscendConfig:
                 "mlp_tensor_parallel_size": 1
             },
             "scheduler_config": {
-                "enable_balance_scheduling": false,
                 "recompute_scheduler_enable": false,
                 "short_request_first_config": {
                     "enabled": false,
@@ -688,8 +687,8 @@ class AscendConfig:
     - Pure-derived fields computed automatically and not user-settable:
       ``enable_sp_by_pass``, ``pd_tp_ratio``, ``pd_head_ratio``,
       ``num_head_replica``.
-    - Deprecated top-level scheduler keys (``enable_balance_scheduling``,
-      ``recompute_scheduler_enable``, ``short_request_first_config``,
+    - Deprecated top-level scheduler keys (``recompute_scheduler_enable``,
+      ``short_request_first_config``,
       ``batch_job_sched_config``) still resolve,
       but emit deprecation warnings; prefer nesting under
       ``scheduler_config`` as shown above.
@@ -1841,7 +1840,6 @@ class SchedulerConfig:
     typed fields that pydantic coerces from nested dicts.
     """
 
-    enable_balance_scheduling: bool = False
     recompute_scheduler_enable: bool = False
     short_request_first_config: ShortRequestFirstConfig = dataclasses.field(default_factory=ShortRequestFirstConfig)
     batch_job_sched_config: BatchJobSchedConfig = dataclasses.field(default_factory=BatchJobSchedConfig)
@@ -1856,6 +1854,13 @@ class SchedulerConfig:
         elif not isinstance(scheduler_config, dict):
             raise ValueError(
                 f"additional_config.scheduler_config must be a dict, got {type(scheduler_config).__name__}."
+            )
+
+        if "enable_balance_scheduling" in scheduler_config or "enable_balance_scheduling" in additional_config:
+            raise ValueError(
+                "Balance scheduling has been removed. Remove enable_balance_scheduling from "
+                "additional_config.scheduler_config and the legacy top-level additional_config, "
+                "including when set to false. The cross-DP admission gate is no longer available."
             )
 
         def _resolve(config_key: str, default: Any) -> Any:
@@ -1878,9 +1883,6 @@ class SchedulerConfig:
             return default
 
         resolved = {
-            # Balance scheduling is configured only through additional_config;
-            # the legacy environment fallback has been removed.
-            "enable_balance_scheduling": _resolve("enable_balance_scheduling", False),
             "recompute_scheduler_enable": _resolve("recompute_scheduler_enable", False),
             # Let pydantic coerce the resolved dicts into typed sub-configs.
             "short_request_first_config": _resolve("short_request_first_config", {}),
@@ -1891,20 +1893,6 @@ class SchedulerConfig:
         # typos instead of the resolver silently dropping them.
         resolved.update({key: value for key, value in scheduler_config.items() if key not in resolved})
         return cls(**resolved)  # type: ignore[arg-type]
-
-    @model_validator(mode="after")
-    def _warn_balance_scheduling_deprecated(self) -> SchedulerConfig:
-        if self.enable_balance_scheduling:
-            logger.warning_once(
-                "Balance scheduling (scheduler_config.enable_balance_scheduling) is deprecated as of "
-                "vLLM Ascend v0.33.0 and will be removed in a future release. "
-                "It remains active while enabled. Set "
-                "additional_config.scheduler_config.enable_balance_scheduling=false (the default) "
-                "to use the normal scheduler path. See "
-                "https://github.com/vllm-project/vllm-ascend/issues/23229 for the sunset plan "
-                "and to share workloads that still require the global admission gate."
-            )
-        return self
 
 
 @config
@@ -2140,7 +2128,6 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "_sparse_li_layer_filter_enabled",
         # SchedulerConfig-internal top-level legacy keys (resolved internally,
         # then replaced by the typed scheduler_config passed above).
-        "enable_balance_scheduling",
         "recompute_scheduler_enable",
         "short_request_first_config",
         "batch_job_sched_config",

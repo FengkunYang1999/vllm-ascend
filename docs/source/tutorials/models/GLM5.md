@@ -218,7 +218,7 @@ If you want to deploy multi-node environment, you need to set up environment on 
     --quantization ascend \
     --enable-chunked-prefill \
     --enable-prefix-caching \
-    --additional-config '{"multistream_overlap_shared_expert": true, "enable_balance_scheduling": true, "enable_flashcomm1": true}' \
+    --additional-config '{"multistream_overlap_shared_expert": true, "enable_flashcomm1": true}' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
@@ -255,7 +255,7 @@ If you want to deploy multi-node environment, you need to set up environment on 
     --enable-chunked-prefill \
     --enable-prefix-caching \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --additional-config '{"multistream_overlap_shared_expert": true, "enable_balance_scheduling": true, "enable_flashcomm1": true}' \
+    --additional-config '{"multistream_overlap_shared_expert": true, "enable_flashcomm1": true}' \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
@@ -278,7 +278,6 @@ Only the key parameters specific to this model/scenario are described below. `ma
 
 - `"enable_flashcomm1": true`: Enables FlashComm optimization to reduce communication overhead (mainly benefits the prefill path). With FlashComm enabled, `layer_sharding` cannot include `o_proj`.
 - `"enable_mlapo": true`: Enables the MLA preprocess fusion operator (MlaPreprocessOperation). Enabled by default for w8a8 models — significantly improves Decode performance but consumes more NPU memory; set `"enable_mlapo": false` if memory is a priority. Recommended for w8a8; w4a8 may not benefit.
-- `"enable_balance_scheduling": true`: Deprecated as of v0.33.0 and planned for removal in a future release. Enabled configurations remain active with a startup warning. Set `scheduler_config.enable_balance_scheduling=false` and remove the legacy top-level key to disable the global admission gate across DP ranks. This can change throughput, TTFT, and TPOT; remeasure them for your workload. See [RFC #23229](https://github.com/vllm-project/vllm-ascend/issues/23229).
 
 **Performance tuning notes for single-node:**
 
@@ -339,7 +338,7 @@ Common Issues Tip: If you encounter issues, Refer to [FAQs](../../faqs.md).
     --async-scheduling \
     --kv-cache-dtype int8 \
     --attention_config.indexer_kv_dtype int8 \
-    --additional-config '{"enable_balance_scheduling": true, "ascend_compilation_config": {"fuse_muls_add": true}, "enable_flashcomm1": true, "enable_fused_mc2": true, "enable_mlapo": true}' \
+    --additional-config '{"ascend_compilation_config": {"fuse_muls_add": true}, "enable_flashcomm1": true, "enable_fused_mc2": true, "enable_mlapo": true}' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
     ```
@@ -387,7 +386,7 @@ Common Issues Tip: If you encounter issues, Refer to [FAQs](../../faqs.md).
     --async-scheduling \
     --kv-cache-dtype int8 \
     --attention_config.indexer_kv_dtype int8 \
-    --additional-config '{"enable_balance_scheduling": true, "ascend_compilation_config": {"fuse_muls_add": true}, "enable_flashcomm1": true, "enable_fused_mc2": true, "enable_mlapo": true}' \
+    --additional-config '{"ascend_compilation_config": {"fuse_muls_add": true}, "enable_flashcomm1": true, "enable_fused_mc2": true, "enable_mlapo": true}' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
     ```
@@ -438,7 +437,7 @@ Common Issues Tip: If you encounter issues, Refer to [FAQs](../../faqs.md).
     --trust-remote-code \
     --gpu-memory-utilization 0.95 \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --additional-config '{"multistream_overlap_shared_expert": true, "enable_balance_scheduling": true, "enable_flashcomm1": true}' \
+    --additional-config '{"multistream_overlap_shared_expert": true, "enable_flashcomm1": true}' \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
@@ -482,7 +481,7 @@ Common Issues Tip: If you encounter issues, Refer to [FAQs](../../faqs.md).
     --trust-remote-code \
     --gpu-memory-utilization 0.95 \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --additional-config '{"multistream_overlap_shared_expert": true, "enable_balance_scheduling": true, "enable_flashcomm1": true}' \
+    --additional-config '{"multistream_overlap_shared_expert": true, "enable_flashcomm1": true}' \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
@@ -510,7 +509,6 @@ In addition to all single-node parameters described in [Single-Node Online Deplo
 **w8a8c8-specific `--additional-config` fields:**
 
 - `--prefill-context-parallel-size`: Enables PCP to accelerate long-context prefill.
-- `"enable_balance_scheduling": true`: Improves output throughput and reduces TPOT in the v1 scheduler. Not recommended when Prefill-Decode is separated.
 - `"ascend_compilation_config": {"fuse_muls_add": true}`: Fuses multiply-add operations.
 - `"multistream_overlap_shared_expert": true`: Overlaps shared-expert computation on an additional stream. Automatically disabled when `"enable_fused_mc2": true`.
 
@@ -1462,7 +1460,6 @@ The following optimizations must be explicitly enabled to take effect. They appl
 |Fused MC2|A3 prefill nodes|`--additional-config '{"enable_fused_mc2": true}'`|Replaces ALLTOALL+MC2 with the `dispatch_ffn_combine`/`dispatch_gmm_combine_decode` operators, reducing MoE communication overhead and improving MoE inference performance|`dispatch_ffn_combine` only for w8a8, EP≤32, non-MTP, non-dynamic-EPLB; conflicts with `multistream_overlap_shared_expert` (the latter is auto-disabled)|
 |MLAPO|A3 co-located high-throughput / PD decode nodes|`--additional-config '{"enable_mlapo": true}'`|Fuses the MLA preprocess operations, significantly improving decode performance|Consumes more NPU memory; in PD scenarios enable on decode nodes only|
 |PCP|A3 prefill nodes; long context (≥128k)|`--prefill-context-parallel-size`|PCP accelerates long-context prefill, reducing TTFT for long prompts|In the reference configs, enabled on co-located nodes and PD prefill nodes|
-|Balance Scheduling|A3 single-node / co-located / non-PD scenarios|`--additional-config '{"enable_balance_scheduling": true}'`|Improves output throughput and reduces TPOT in the v1 scheduler|TTFT may degrade; not recommended when Prefill-Decode is separated|
 |Sparse SFA C8|A3 (w8a8c8); long-context prefill|`--additional-config '{"enable_sparse_sfa_c8": true}'`|Sparse Flash Attention skips unnecessary attention computation of the C8 quantized model, accelerating long-context prefill|Experimental in v0.23.0. In the reference configs, enabled in the high-throughput and PD scenarios; disabled in the low-latency scenario|
 |Sparse LI C8|A3 (w8a8c8)|`--attention_config.indexer_kv_dtype int8`|Sparse attention optimization reduces computation of the C8 quantized model, improving throughput|Independent of `enable_sparse_sfa_c8`; the reference low-latency config disables both|
 |Recompute Scheduler|A3 decode nodes|`--additional-config '{"recompute_scheduler_enable": true}'`|Recomputes KV cache on prefill nodes when decode KV cache is insufficient, avoiding decode-side OOM and improving throughput|Set to `false` on prefill nodes|

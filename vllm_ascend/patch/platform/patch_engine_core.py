@@ -18,7 +18,6 @@ import vllm.v1.engine.core as _engine_core_mod
 from vllm.v1.engine.core import EngineCoreProc
 
 from vllm_ascend.ascend_config import init_ascend_config
-from vllm_ascend.patch.platform.patch_balance_schedule import BalanceDPEngineCoreProc, _balance_scheduling_enabled
 from vllm_ascend.patch.platform.patch_dyntra_lb_core import DyntraLBDPEngineCoreProc, _get_dyntra_lb_config
 from vllm_ascend.patch.platform.patch_dyntra_lb_core import _print_rank_0 as dyntra_print_rank_0
 
@@ -36,8 +35,6 @@ def _patch_dp_engine_core_proc(vllm_config, dp_rank: int):
             dyntra_lb_config.enable_diagnostics,
         )
         _engine_core_mod.DPEngineCoreProc = DyntraLBDPEngineCoreProc
-    elif _balance_scheduling_enabled(vllm_config):
-        _engine_core_mod.DPEngineCoreProc = BalanceDPEngineCoreProc
 
 
 def _run_engine_core_patch_func(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
@@ -55,10 +52,8 @@ def _apply_patch() -> None:
         return
     _PATCHED = True
 
-    # Patch EngineCoreProc.run_engine_core
-    # And in _run_engine_core_patch_func:
-    # 1. Patch EngineCore.__init__ by _apply_profiling_patches
-    # 2. Patch class DPEngineCoreProc by _patch_dp_engine_core_proc
+    # Initialize AscendConfig and select the DyntraLB DP engine core, when
+    # enabled, before delegating to the upstream process entry point.
     EngineCoreProc.run_engine_core = staticmethod(_run_engine_core_patch_func)
 
 

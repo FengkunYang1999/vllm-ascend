@@ -1339,7 +1339,7 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
 def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     """Validate Ascend-specific options.
 
-    Covers the scheduler extension policies (enable_balance_scheduling / short_request_first_config /
+    Covers the scheduler extension policies (short_request_first_config /
     dyntra_lb_config / recompute_scheduler_enable). Reads from the AscendConfig singleton
     initialized from vllm_config; env fallbacks are handled inside AscendConfig.
     """
@@ -1359,23 +1359,11 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         additional_config = vllm_config.additional_config
     scheduler_extension_config = ascend_config.scheduler_config
 
-    # enable_balance_scheduling: only supported in PD-mixed mode
-    if scheduler_extension_config.enable_balance_scheduling:
-        kv_transfer_config = vllm_config.kv_transfer_config
-        kv_role = getattr(kv_transfer_config, "kv_role", None)
-        if kv_transfer_config is not None and kv_role != "kv_both":
-            raise ValueError(
-                "enable_balance_scheduling only supports PD-mixed mode "
-                "(kv_role='kv_both' or no kv_transfer_config), and is not supported in "
-                "PD-disaggregated mode (kv_role='kv_producer'/'kv_consumer')."
-            )
-
     _validate_kv_load_failure_policy(vllm_config)
     _validate_mooncake_connector_v1_role(vllm_config)
 
     # short_request_first_config requires FCFS and excludes batch-job and
-    # kv-consumer paths. When profiling-chunk is also enabled, the profiling
-    # chunk scheduler installs the SRF waiting queue itself.
+    # kv-consumer paths.
     if scheduler_extension_config.short_request_first_config.enabled:
         kv_transfer_config = vllm_config.kv_transfer_config
         kv_role = getattr(kv_transfer_config, "kv_role", None)
@@ -1398,6 +1386,28 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             vllm_config.scheduler_config.scheduler_cls = (
                 "vllm_ascend.core.short_request_first_scheduler.ShortRequestFirstAsyncScheduler"
             )
+        else:
+            if getattr(vllm_config, "diffusion_config", None) is not None:
+                raise ValueError(
+                    "Synchronous ShortRequestFirst scheduling cannot be combined with diffusion_config. "
+                    "Disable short_request_first_config to use the diffusion scheduler."
+                )
+            scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+            if isinstance(scheduler_cls, type):
+                scheduler_cls = f"{scheduler_cls.__module__}.{scheduler_cls.__qualname__}"
+            if scheduler_cls not in (
+                None,
+                "vllm.v1.core.sched.scheduler.Scheduler",
+                "vllm_ascend.core.short_request_first_scheduler.ShortRequestFirstScheduler",
+            ):
+                raise ValueError(
+                    "Synchronous ShortRequestFirst scheduling cannot be combined with a custom scheduler_cls "
+                    f"({vllm_config.scheduler_config.scheduler_cls!r}). "
+                    "Disable short_request_first_config or use the default scheduler."
+                )
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm_ascend.core.short_request_first_scheduler.ShortRequestFirstScheduler"
+            )
 
     dyntra_lb_config = scheduler_extension_config.dyntra_lb_config
     if dyntra_lb_config.enabled:
@@ -1408,8 +1418,6 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # DP nodes, or together with the other scheduling modes rejected
         # below.
         # Verified models: Qwen3-30B, Qwen3.5-35B
-        if scheduler_extension_config.enable_balance_scheduling:
-            raise ValueError("DyntraLB cannot be used with enable_balance_scheduling.")
         kv_transfer_config = vllm_config.kv_transfer_config
         kv_role = getattr(kv_transfer_config, "kv_role", None)
         if kv_transfer_config is None or kv_role != "kv_consumer":
@@ -1773,17 +1781,15 @@ def _setup_worker_and_scheduler(
 def _swa_bounded_replay_unsupported_mode(ascend_config) -> str | None:
     """Name the Ascend mode that cannot honor SWA bounded replay.
 
-    Upstream implements the rewind inside ``Scheduler.schedule()``. Four Ascend
-    modes replace that method with a verbatim copy of an older upstream body, so
+    Upstream implements the rewind inside ``Scheduler.schedule()``. Recompute
+    and DyntraLB replace that method with a copy of an older upstream body, so
     they neither rewind a prefix hit nor realize that the chunk they scheduled
-    is a replay; activating any of them therefore has to turn the switch off.
+    is a replay; activating either mode therefore has to turn the switch off.
 
     The other two modes reach upstream's ``schedule()`` and inherit the rewind:
     ``batch_job_aware_scheduler`` calls ``super()``, and
     ``short_request_first_scheduler`` does not override ``schedule()`` at all --
-    it only installs a request queue. Note that ``enable_balance_scheduling`` is
-    a fork despite being a monkeypatch rather than a ``scheduler_cls``, and that
-    its ``super().schedule()`` fallback only applies while balancing is off.
+    it only installs a request queue.
 
     """
     scheduler_config = ascend_config.scheduler_config
@@ -1791,8 +1797,6 @@ def _swa_bounded_replay_unsupported_mode(ascend_config) -> str | None:
         return "recompute_scheduler_enable"
     if scheduler_config.dyntra_lb_config.enabled:
         return "dyntra_lb_config"
-    if scheduler_config.enable_balance_scheduling:
-        return "enable_balance_scheduling"
     return None
 
 

@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 from vllm import SamplingParams
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import ECMooncakeLoadSpec
 from vllm.distributed.ec_transfer.ec_connector.mooncake.state import SchedulerTransferTable
@@ -27,7 +26,6 @@ from vllm_ascend.core.recompute_scheduler import (
 )
 from vllm_ascend.distributed.ec_transfer.ec_connector.mooncake.connector import AscendECMooncakeConnector
 from vllm_ascend.distributed.ec_transfer.ec_connector.mooncake.scheduler import AscendECMooncakeScheduler
-from vllm_ascend.patch.platform.patch_balance_schedule import BalanceScheduler
 
 PROMPT_TOKENS = 32
 MAX_NUM_BATCHED_TOKENS = 64
@@ -42,7 +40,6 @@ SCHEDULER_CLASSES = [
     AsyncRecomputeScheduler,
     DyntraLBRecomputeScheduler,
     AsyncDyntraLBRecomputeScheduler,
-    BalanceScheduler,
 ]
 
 
@@ -58,10 +55,6 @@ def _make_scheduler(scheduler_cls: type[Scheduler]) -> Scheduler:
     # scheduler without loading a multimodal model or running its processor.
     scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=ENCODER_BUDGET)
     scheduler.max_num_encoder_input_tokens = ENCODER_BUDGET
-    if isinstance(scheduler, BalanceScheduler):
-        # Exercise the local schedule implementation, not its super fallback.
-        scheduler._balance_enabled = True
-        scheduler.balance_queue = [torch.tensor([0], dtype=torch.int)]
     return scheduler
 
 

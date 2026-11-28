@@ -1,3 +1,5 @@
+import ast
+import inspect
 import time
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -117,6 +119,22 @@ def test_dyntra_lb_scheduler_uses_policy_mixin():
     assert issubclass(DyntraLBScheduler, DyntraLBPolicyMixin)
     assert issubclass(AsyncDyntraLBScheduler, DyntraLBScheduler)
     assert issubclass(AsyncDyntraLBScheduler, AsyncScheduler)
+
+
+def test_dyntra_lb_scheduler_forwards_uses_mrope_to_from_request():
+    """Preserve CPU-side multimodal payloads needed by M-RoPE after a cache hit."""
+    tree = ast.parse(inspect.getsource(dyntra_lb_scheduler_module))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "from_request"
+    ]
+    assert calls, "DyntraLB scheduler has no NewRequestData.from_request() call"
+    for call in calls:
+        assert any(keyword.arg == "uses_mrope" for keyword in call.keywords), (
+            f"dyntra_lb_scheduler.py:{call.lineno}: NewRequestData.from_request() must forward "
+            "uses_mrope=self.model_uses_mrope"
+        )
 
 
 def _create_scheduler_with_diagnostics(enable_diagnostics: bool):

@@ -143,15 +143,6 @@ msgid ""
 "and set `data-parallel-size` to 1."
 msgstr "如果您只关心短上下文低延迟，可以显式设置 `--max-model-len 32768`。您也可以将 `tensor-parallel-size` 设置为 16，并将 `data-parallel-size` 设置为 1。"
 
-msgid ""
-"`export VLLM_ASCEND_BALANCE_SCHEDULING=1` is used to enhance scheduling "
-"capacity between prefill and decode. This will work remarkably with a "
-"larger `data-parallel-size`. This can increace performance when "
-"concurrency gets closer to values equals to `data-parallel-size` times "
-"`max-num-seqs`."
-msgstr ""
-"`export VLLM_ASCEND_BALANCE_SCHEDULING=1` 用于增强 prefill 和 decode 之间的调度能力。这在 `data-parallel-size` 较大时效果显著。当并发数接近 `data-parallel-size` 乘以 `max-num-seqs` 的值时，可以提升性能。"
-
 msgid "Remarks:"
 msgstr "备注："
 
@@ -165,9 +156,8 @@ msgstr "如果您主要依赖 `/v1/responses` 的推理语义，建议改用 `--
 
 msgid ""
 "To receive a better performance on long-context like 128k or 64k, we "
-"recommend to do changes as shown below, and you can remove `export "
-"VLLM_ASCEND_BALANCE_SCHEDULING=1`."
-msgstr "为了在 128k 或 64k 等长上下文场景中获得更好的性能，我们建议进行如下更改，并且可以移除 `export VLLM_ASCEND_BALANCE_SCHEDULING=1`。"
+"recommend to do changes as shown below."
+msgstr "为了在 128k 或 64k 等长上下文场景中获得更好的性能，我们建议进行如下更改。"
 
 msgid ""
 "If you will to test with `curl` command, you can add following commands "

@@ -102,9 +102,9 @@ ShortRequestFirst also emits an aggregate stats log every 5s so queue behavior i
 
 ## Scheduler compatibility
 
-ShortRequestFirst changes only the waiting-queue policy. It requires FCFS scheduling and supports both synchronous and asynchronous scheduling, including in combination with profiling-chunk scheduling. It is not supported with batch-job-aware scheduling or on PD-disaggregated D nodes (`kv_role='kv_consumer'`).
+ShortRequestFirst changes only the waiting-queue policy. It requires FCFS scheduling and supports both synchronous and asynchronous scheduling. It is not supported with batch-job-aware scheduling or on PD-disaggregated D nodes (`kv_role='kv_consumer'`).
 
-The `additional_config.scheduler_config.enable_balance_scheduling` setting keeps its existing behavior: it controls balance scheduling's cross-DP admission logic. ShortRequestFirst is installed independently of whether balance scheduling is enabled, so the balance-disabled path continues to delegate scheduling to vLLM while using the ShortRequestFirst waiting queue.
+ShortRequestFirst installs its waiting queue while delegating request scheduling to vLLM. Synchronous ShortRequestFirst requires the standard vLLM scheduler and rejects custom `scheduler_cls` overrides or diffusion scheduling at startup.
 
 ## Minimal examples
 

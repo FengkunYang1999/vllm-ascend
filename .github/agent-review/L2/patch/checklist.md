@@ -19,9 +19,9 @@ apply globally before workers start, worker patches apply per worker.
   set necessary. Broad-target patches (e.g. rewriting
   `torch.distributed.all_reduce` globally) need an explicit justification
   in the catalog why-field; flag patches that grew targets without one.
-- `L2-patch#deprecated-channel`: A patch enabled via a deprecated env var
-  (e.g. balance scheduling's `VLLM_ASCEND_BALANCE_SCHEDULING`) must keep
-  additional_config as the primary switch and mark the env var deprecated;
+- `L2-patch#deprecated-channel`: A patch migrating away from an env var
+  must use additional_config as the primary switch and mark any retained
+  legacy env var deprecated;
   new patches must not add env-var-only switches.
 - `L2-patch#behavior-audit`: Patches silently change upstream behavior for
   ALL users of the plugin, not only the opt-in feature. A patch that alters

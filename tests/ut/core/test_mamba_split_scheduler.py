@@ -51,7 +51,7 @@ def _make_scheduler(
         kwargs["kv_transfer_config"] = (
             None if role is None else KVTransferConfig(kv_connector="MooncakeConnector", kv_role=role)
         )
-        # Keep BalanceScheduler runtime reporting off the read-only source.
+        # Keep runtime reporting off the read-only source.
         kwargs["additional_config"] = {
             "runtime_config_path": str(tmp_path / "runtime_config.json"),
             "runtime_report_dir": str(tmp_path / "report"),

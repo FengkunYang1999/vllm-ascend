@@ -168,15 +168,6 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
     expr: return | attr num_scheduled_tokens | str
   - name: num_scheduled_tokens
     expr: return | attr num_scheduled_tokens | str
-- symbol: vllm_ascend.patch.platform.patch_balance_schedule:BalanceScheduler.schedule
-  min_version: "0.9.1"
-  domain: Scheduler
-  name: BalanceScheduler.schedule
-  attributes:
-  - name: req_ids
-    expr: return | attr num_scheduled_tokens | str
-  - name: num_scheduled_tokens
-    expr: return | attr num_scheduled_tokens | str
 - symbol: vllm.v1.executor.uniproc_executor:UniProcExecutor.execute_model
   min_version: "0.9.1"
   handler: ms_service_profiler.patcher.vllm.handlers.v1.model_handlers:execute_model

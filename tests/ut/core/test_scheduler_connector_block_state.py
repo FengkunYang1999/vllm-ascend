@@ -22,22 +22,16 @@ from vllm_ascend.core.recompute_scheduler import (
     DyntraLBRecomputeScheduler,
     RecomputeScheduler,
 )
-from vllm_ascend.patch.platform.patch_balance_schedule import BalanceScheduler
 
 
 @pytest.mark.parametrize(
     "scheduler_cls",
-    [DyntraLBScheduler, AsyncDyntraLBScheduler, BalanceScheduler],
+    [DyntraLBScheduler, AsyncDyntraLBScheduler],
 )
 @pytest.mark.parametrize("with_connector", [False, True])
 def test_boundary_state_is_drained_consumed_and_not_dispatched(monkeypatch, scheduler_cls, with_connector):
     """Hand off main snapshots locally; preserve release connector metadata."""
     scheduler = create_dyntra_lb_scheduler(make_dyntra_test_config(), scheduler_cls=scheduler_cls)
-    if isinstance(scheduler, BalanceScheduler):
-        # Exercise the local schedule implementation, not its super fallback.
-        scheduler._balance_enabled = True
-        scheduler.balance_queue = [torch.tensor([0], dtype=torch.int)]
-
     scheduler.connector = object() if with_connector else None
     scheduler.ec_connector = None
     scheduler.requests = {"cached": object(), "boundary": object()}

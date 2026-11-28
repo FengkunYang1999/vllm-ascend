@@ -36,12 +36,6 @@ DyntraLB has the following startup requirements:
 Configure DyntraLB only on Decode nodes. Do not add `dyntra_lb_config` with
 `enabled=true` to Prefill nodes.
 
-DyntraLB cannot be combined with:
-
-- `scheduler_config.enable_balance_scheduling`
-
-The service rejects these unsupported combinations during startup.
-
 ## Configuration
 
 Add `dyntra_lb_config` under `scheduler_config` in the Decode node's

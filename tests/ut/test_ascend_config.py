@@ -733,7 +733,6 @@ class TestAscendConfig(TestBase):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
             "scheduler_config": {
-                "enable_balance_scheduling": True,
                 "recompute_scheduler_enable": True,
                 "short_request_first_config": {"enabled": True, "threshold": 512},
             }
@@ -741,7 +740,6 @@ class TestAscendConfig(TestBase):
 
         scheduler_config = init_ascend_config(test_vllm_config).scheduler_config
 
-        self.assertTrue(scheduler_config.enable_balance_scheduling)
         self.assertTrue(scheduler_config.recompute_scheduler_enable)
         self.assertTrue(scheduler_config.short_request_first_config.enabled)
         self.assertEqual(scheduler_config.short_request_first_config.threshold, 512)
@@ -1308,58 +1306,68 @@ class TestSparseKVOffloadConfig(TestBase):
 
 class TestSchedulerConfig(TestBase):
     def test_defaults(self):
-        config = SchedulerConfig.from_additional_config({})
+        with patch("vllm_ascend.ascend_config.logger.warning_once") as warning:
+            config = SchedulerConfig.from_additional_config({})
 
-        self.assertFalse(config.enable_balance_scheduling)
+        warning.assert_not_called()
         self.assertFalse(config.recompute_scheduler_enable)
         self.assertFalse(config.short_request_first_config.enabled)
         self.assertFalse(hasattr(config, "_additional_config"))
-        self.assertFalse(hasattr(config, "_balance_env_value"))
 
-    def test_enabled_balance_scheduling_warns_without_disabling(self):
+    def test_removed_balance_scheduling_is_rejected_in_both_config_locations(self):
+        for value in (True, False, "true", "false"):
+            for additional_config in (
+                {"scheduler_config": {"enable_balance_scheduling": value}},
+                {"enable_balance_scheduling": value},
+            ):
+                with (
+                    self.subTest(additional_config=additional_config),
+                    self.assertRaisesRegex(ValueError, "Balance scheduling has been removed.*Remove.*enable_balance"),
+                ):
+                    SchedulerConfig.from_additional_config(additional_config)
+
+    def test_removed_balance_scheduling_cannot_be_masked_by_nested_precedence(self):
         for additional_config in (
-            {"scheduler_config": {"enable_balance_scheduling": True}},
-            {"enable_balance_scheduling": True},
-            {"scheduler_config": {"enable_balance_scheduling": "true"}},
-            {
-                "scheduler_config": {"enable_balance_scheduling": True},
-                "enable_balance_scheduling": False,
-            },
-        ):
-            with self.subTest(additional_config=additional_config):
-                with patch("vllm_ascend.ascend_config.logger.warning_once") as warning:
-                    config = SchedulerConfig.from_additional_config(additional_config)
-
-                self.assertTrue(config.enable_balance_scheduling)
-                messages = [call.args[0] for call in warning.call_args_list if "Balance scheduling" in call.args[0]]
-                self.assertEqual(len(messages), 1)
-                self.assertIn("deprecated as of vLLM Ascend v0.33.0", messages[0])
-                self.assertIn("removed in a future release", messages[0])
-                self.assertIn("remains active while enabled", messages[0])
-                self.assertIn("additional_config.scheduler_config.enable_balance_scheduling=false", messages[0])
-                self.assertIn("https://github.com/vllm-project/vllm-ascend/issues/23229", messages[0])
-
-    def test_disabled_balance_scheduling_does_not_warn_about_feature_deprecation(self):
-        for additional_config in (
-            {},
-            {"scheduler_config": {"enable_balance_scheduling": False}},
-            {"enable_balance_scheduling": False},
-            {"scheduler_config": {"enable_balance_scheduling": "false"}},
             {
                 "scheduler_config": {"enable_balance_scheduling": False},
                 "enable_balance_scheduling": True,
             },
             {
-                "scheduler_config": {"enable_balance_scheduling": "false"},
-                "enable_balance_scheduling": True,
+                "scheduler_config": {"enable_balance_scheduling": True},
+                "enable_balance_scheduling": False,
             },
         ):
-            with self.subTest(additional_config=additional_config):
-                with patch("vllm_ascend.ascend_config.logger.warning_once") as warning:
-                    config = SchedulerConfig.from_additional_config(additional_config)
+            with (
+                self.subTest(additional_config=additional_config),
+                self.assertRaisesRegex(ValueError, "Balance scheduling has been removed"),
+            ):
+                SchedulerConfig.from_additional_config(additional_config)
 
-                self.assertFalse(config.enable_balance_scheduling)
-                self.assertFalse(any("Balance scheduling" in call.args[0] for call in warning.call_args_list))
+    def test_removed_balance_scheduling_is_not_a_constructor_field(self):
+        with self.assertRaisesRegex(ValueError, "enable_balance_scheduling"):
+            SchedulerConfig(enable_balance_scheduling=False)  # type: ignore[call-arg]
+
+    def test_init_rejects_removed_balance_scheduling_with_or_without_omni(self):
+        for omni_installed in (False, True):
+            for value in (True, False, "true", "false"):
+                for additional_config in (
+                    {"scheduler_config": {"enable_balance_scheduling": value}},
+                    {"enable_balance_scheduling": value},
+                ):
+                    with (
+                        self.subTest(omni_installed=omni_installed, additional_config=additional_config),
+                        patch("vllm_ascend.ascend_config._ASCEND_CONFIG", None),
+                        patch(
+                            "vllm_ascend.ascend_config.importlib.util.find_spec",
+                            side_effect=lambda name, *args, _omni_installed=omni_installed, **kwargs: (
+                                (object() if _omni_installed else None)
+                                if name == "vllm_omni"
+                                else real_find_spec(name, *args, **kwargs)
+                            ),
+                        ),
+                        self.assertRaisesRegex(ValueError, "Balance scheduling has been removed"),
+                    ):
+                        init_ascend_config(SimpleNamespace(additional_config=additional_config))
 
     @patch("vllm_ascend.ascend_config.logger.warning_once")
     def test_none_config_uses_defaults_and_legacy_fallback(self, mock_warning_once):
@@ -1402,7 +1410,6 @@ class TestSchedulerConfig(TestBase):
         config = SchedulerConfig.from_additional_config(
             {
                 "scheduler_config": {
-                    "enable_balance_scheduling": True,
                     "recompute_scheduler_enable": True,
                     "short_request_first_config": {
                         "enabled": True,
@@ -1413,7 +1420,6 @@ class TestSchedulerConfig(TestBase):
             },
         )
 
-        self.assertTrue(config.enable_balance_scheduling)
         self.assertTrue(config.recompute_scheduler_enable)
         self.assertTrue(config.short_request_first_config.enabled)
         self.assertEqual(config.short_request_first_config.threshold, 512)
@@ -1423,16 +1429,14 @@ class TestSchedulerConfig(TestBase):
     def test_legacy_top_level_config_warns_and_remains_supported(self, mock_warning_once):
         config = SchedulerConfig.from_additional_config(
             {
-                "enable_balance_scheduling": True,
                 "recompute_scheduler_enable": True,
                 "short_request_first_config": {"enabled": True},
             },
         )
 
-        self.assertTrue(config.enable_balance_scheduling)
         self.assertTrue(config.recompute_scheduler_enable)
         self.assertTrue(config.short_request_first_config.enabled)
-        self.assertEqual(mock_warning_once.call_count, 4)
+        self.assertEqual(mock_warning_once.call_count, 2)
 
     @patch("vllm_ascend.ascend_config.logger.warning_once")
     def test_nested_config_wins_and_legacy_fields_fill_missing_values(self, mock_warning_once):
@@ -1440,18 +1444,16 @@ class TestSchedulerConfig(TestBase):
             {
                 "scheduler_config": {
                     "recompute_scheduler_enable": True,
-                    "short_request_first_config": {"enabled": True},
                 },
                 "recompute_scheduler_enable": False,
-                "enable_balance_scheduling": True,
-                "short_request_first_config": {"enabled": False},
+                "short_request_first_config": {"enabled": True, "threshold": 512},
             },
         )
 
         self.assertTrue(config.recompute_scheduler_enable)
         self.assertTrue(config.short_request_first_config.enabled)
-        self.assertTrue(config.enable_balance_scheduling)
-        self.assertEqual(mock_warning_once.call_count, 4)
+        self.assertEqual(config.short_request_first_config.threshold, 512)
+        self.assertEqual(mock_warning_once.call_count, 2)
 
 
 class TestSubconfigPydanticTypeValidation(TestBase):
