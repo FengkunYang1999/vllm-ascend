@@ -1368,6 +1368,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     "floating-point weights on A5. Some layers use an "
                     "unsupported weight type, so MLAPO is disabled for these layers."
                 )
+        self._check_prolog_v3_projection_bias()
         if self.enable_mlapo or self.fa_quant_layer:
             self._process_weights_for_fused(act_dtype)
         else:
@@ -1384,6 +1385,26 @@ class AscendMLAImpl(MLAAttentionImpl):
         self._prepare_strided_kv_workspace()
         if self.use_flashmla and self.supports_prolog_v3_writer():
             self._prepare_flashmla_writer_buffers()
+
+    def _check_prolog_v3_projection_bias(self) -> None:
+        """A bias-free Q-A/KV-A matmul must map zero to zero."""
+        proj = self.fused_qkv_a_proj
+        bias = None if getattr(proj, "skip_bias_add", False) else getattr(proj, "bias", None)
+        if not isinstance(bias, torch.Tensor) and not isinstance(getattr(proj, "quant_bias", None), torch.Tensor):
+            return
+        if self.use_flashmla or self.use_pcp or self.is_pcp_decode_sharded or not self.supports_prolog_v3_writer():
+            return
+
+        # Test the loaded projection before fused weight preparation can free it.
+        # A stored quant_bias may just cancel an input zero point. In that case
+        # the native projection still maps zero to zero and V3 remains eligible.
+        zero = proj.weight.new_zeros((1, proj.input_size), dtype=self.dtype)
+        with torch.no_grad():
+            projected = proj.quant_method.apply(proj, zero, bias=bias)
+        if (projected != 0).any().item():
+            if getattr(self, "_prolog_v3_weights", None) is not None:
+                raise RuntimeError("Reloading a biased MLA projection requires rebuilding the KV cache and graphs.")
+            self._prolog_v3_requires_projection_bias = True
 
     def _prepare_flashmla_writer_buffers(self) -> None:
         """Keep a bounded dense PROLOG workspace alive across graph replay."""
@@ -1942,7 +1963,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
     def supports_prolog_v3_writer(self) -> bool:
-        """Check the actual A-projection width, including Eagle3's concatenation."""
+        """Whether the strided-cache PROLOG_V3 writer supports this layer."""
+        if getattr(self, "_prolog_v3_requires_projection_bias", False):
+            return False
         return self._supports_strided_mla_projection() and (
             getattr(self.fused_qkv_a_proj, "input_size", None) in PROLOG_V3_SUPPORTED_INPUT_SIZES
         )

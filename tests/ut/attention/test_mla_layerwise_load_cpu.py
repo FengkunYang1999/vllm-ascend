@@ -262,6 +262,25 @@ def test_native_projections_stay_before_connector_and_kvpp_waits(path, fused_pro
     wait.assert_called_once_with(impl.layer_name)
 
 
+@pytest.mark.parametrize("enable_mlapo", [False, True])
+def test_contiguous_cache_preserves_decode_preprocessor(enable_mlapo):
+    impl, metadata, cache, writes, scope = make_forward("native", "decode", Mock())
+    impl.enable_mlapo = enable_mlapo
+    impl.supports_prolog_v3_writer = lambda: True
+    impl._cache_requires_prolog_v3_writer = MethodType(
+        load(MLA, "_cache_requires_prolog_v3_writer", scope, "AscendMLAImpl"), impl
+    )
+    impl._mla_preprocess = Mock(wraps=impl._mla_preprocess)
+    impl.mla_preprocess_only_decode = Mock(wraps=impl.mla_preprocess_only_decode)
+
+    hidden = torch.zeros(metadata.num_actual_tokens, 2)
+    impl.forward(impl.layer_name, hidden, cache, metadata, torch.empty_like(hidden))
+
+    assert impl._mla_preprocess.call_count == int(not enable_mlapo)
+    assert impl.mla_preprocess_only_decode.call_count == int(enable_mlapo)
+    assert writes == ["decode"]
+
+
 def test_profile_run_does_not_wait_for_connector():
     wait = Mock()
     impl, _, _, writes, _ = make_forward("native", "decode", wait)
