@@ -87,12 +87,6 @@ msgstr ""
 "仅在 Decode 节点上配置 DyntraLB。请勿在 Prefill 节点上添加 `enabled=true` 的 "
 "`dyntra_lb_config`。"
 
-msgid "DyntraLB cannot be combined with:"
-msgstr "DyntraLB 不能与以下配置组合使用："
-
-msgid "The service rejects these unsupported combinations during startup."
-msgstr "服务会在启动期间拒绝这些不支持的组合。"
-
 msgid "## Configuration"
 msgstr "## 配置"
 
@@ -351,6 +345,3 @@ msgid ""
 msgstr ""
 "有关完整的`additional_config`模式，请参阅\n"
 "[附加配置](../configuration/additional_config.md)。"
-
-msgid "- `scheduler_config.enable_balance_scheduling`"
-msgstr "- `scheduler_config.enable_balance_scheduling`"

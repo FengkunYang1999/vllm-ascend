@@ -8,7 +8,6 @@ test_cases:
       OMP_NUM_THREADS: "1"
       HCCL_BUFFSIZE: "200"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
-      VLLM_ASCEND_BALANCE_SCHEDULING: "1"
       VLLM_ASCEND_ENABLE_MLAPO: "0"
       VLLM_ENGINE_READY_TIMEOUT_S: "1800"
       SERVER_PORT: "8077"

@@ -81,23 +81,6 @@
 # ==========#
 # Entries are listed in alphabetical order by file name.
 #
-# ** 1. File: platform/patch_balance_schedule.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.core.sched.scheduler.Scheduler`
-#   2. `vllm.v1.engine.core.DPEngineCoreProc` (class provided only; the swap
-#      is performed by patch_engine_core.py when balance scheduling is enabled)
-#    Why:
-#       vLLM v1 scheduling currently enables chunkedprefill by default, which processes prefill and decode
-#       requests simultaneously in a single scheduling session. This can impact the overall system throughput
-#       and performance in some scenarios.
-#    How：
-#       Set --additional-config '{"enable_balance_scheduling": true}' or
-#       set environmental variable VLLM_ASCEND_BALANCE_SCHEDULING=1 (deprecated).
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/pull/29721
-#    Future Plan:
-#       Remove this patch when vLLM merge the PR.
-#
 # ** 2. File: platform/patch_distributed.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `torch.distributed.all_reduce`, `torch.distributed.broadcast`
@@ -138,20 +121,16 @@
 #   1. `vllm.v1.engine.core.EngineCoreProc.run_engine_core`
 #   2. `vllm.v1.engine.core.DPEngineCoreProc` (deferred, selected inside the
 #      wrapper)
-#   3. `vllm.v1.engine.core.EngineCore.post_step` (pp-mtp patch, invocation
-#      moved here from patch_pp_mtp.py)
 #    Why:
-#       Previously patch_balance_schedule and patch_dyntra_lb_core
-#       each wrapped `EngineCoreProc.run_engine_core` independently, forming
-#       an implicit wrapper chain whose correctness depended on import order.
+#       Ascend config must be initialized before selecting the DyntraLB DP
+#       engine core. Upstream does not expose a hook for this runtime selection.
 #    How：
 #       Install the single `run_engine_core` wrapper: initialize the ascend
-#       config, select `DyntraLBDPEngineCoreProc` (dyntra-lb enabled) or
-#       `BalanceDPEngineCoreProc` (balance enabled) at runtime via an explicit
-#       if/elif, then delegate to the pristine upstream entry point stashed at
-#       import. In `spawn` children, unpickling this wrapper imports this
-#       module, deterministically re-applying all engine-core-level patches
-#       before any `EngineCore` is instantiated.
+#       config, select `DyntraLBDPEngineCoreProc` when DyntraLB is enabled,
+#       then delegate to the upstream entry point stashed at import. Otherwise,
+#       leave the upstream DP engine core unchanged. In `spawn` children,
+#       unpickling this wrapper imports this module and installs the entry-point
+#       hook before any `EngineCore` is instantiated.
 #    Related PR (if no, explain why):
 #       No, vllm-ascend internal refactor of its own platform patches.
 #    Future Plan:

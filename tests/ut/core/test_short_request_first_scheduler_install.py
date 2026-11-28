@@ -21,11 +21,13 @@ from unittest.mock import patch
 import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_ascend.core.short_request_first_scheduler import (
     ShortRequestFirstAsyncScheduler,
     ShortRequestFirstRequestQueue,
+    ShortRequestFirstScheduler,
     install_short_request_first_waiting_queue,
 )
 
@@ -109,7 +111,11 @@ def test_rejects_installation_after_request_admission():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_async_scheduler_only_installs_queue_when_enabled(enabled):
+@pytest.mark.parametrize(
+    ("scheduler_cls", "base_cls"),
+    [(ShortRequestFirstScheduler, Scheduler), (ShortRequestFirstAsyncScheduler, AsyncScheduler)],
+)
+def test_scheduler_only_installs_queue_when_enabled(enabled, scheduler_cls, base_cls):
     vllm_config = SimpleNamespace()
     ascend_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(
@@ -121,18 +127,29 @@ def test_async_scheduler_only_installs_queue_when_enabled(enabled):
         )
     )
 
-    def initialize_async_scheduler(scheduler, *args, **kwargs):
+    def initialize_scheduler(scheduler, *args, **kwargs):
         scheduler.vllm_config = kwargs["vllm_config"]
         scheduler.policy = SchedulingPolicy.FCFS
         scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
 
     with (
-        patch.object(AsyncScheduler, "__init__", initialize_async_scheduler),
+        patch.object(base_cls, "__init__", initialize_scheduler),
         patch("vllm_ascend.ascend_config.init_ascend_config", return_value=ascend_config),
     ):
-        scheduler = ShortRequestFirstAsyncScheduler(vllm_config=vllm_config)
+        scheduler = scheduler_cls(vllm_config=vllm_config)
 
     assert isinstance(scheduler.waiting, ShortRequestFirstRequestQueue) is enabled
+    scheduler.waiting.add_request(make_request("long", 1024))
+    scheduler.waiting.add_request(make_request("short", 128))
+    assert scheduler.waiting.pop_request().request_id == ("short" if enabled else "long")
+
+
+@pytest.mark.parametrize(
+    ("scheduler_cls", "base_cls"),
+    [(ShortRequestFirstScheduler, Scheduler), (ShortRequestFirstAsyncScheduler, AsyncScheduler)],
+)
+def test_scheduler_preserves_upstream_schedule(scheduler_cls, base_cls):
+    assert scheduler_cls.schedule is base_cls.schedule
 
 
 @pytest.mark.parametrize(

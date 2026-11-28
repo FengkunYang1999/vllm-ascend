@@ -289,7 +289,7 @@ variable in the selected script. Use the same checkpoint path on all nodes.
       --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
       --kv-cache-dtype int8 \
       --attention_config.indexer_kv_dtype int8 \
-      --additional-config '{"enable_balance_scheduling": true, "multistream_overlap_shared_expert": true, "enable_flashcomm1": true}' \
+      --additional-config '{"multistream_overlap_shared_expert": true, "enable_flashcomm1": true}' \
       --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
 
@@ -592,7 +592,7 @@ If you want to deploy a multi-node environment, first verify the data-plane netw
         --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
         --kv-cache-dtype int8 \
         --attention_config.indexer_kv_dtype int8 \
-        --additional-config '{"enable_balance_scheduling": true, "enable_fused_mc2": 1, "enable_flashcomm1": true}'  \
+        --additional-config '{"enable_fused_mc2": 1, "enable_flashcomm1": true}'  \
         --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
 
@@ -653,7 +653,7 @@ If you want to deploy a multi-node environment, first verify the data-plane netw
         --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
         --kv-cache-dtype int8 \
         --attention_config.indexer_kv_dtype int8 \
-        --additional-config '{"enable_balance_scheduling": true, "enable_fused_mc2": 1, "enable_flashcomm1": true}' \
+        --additional-config '{"enable_fused_mc2": 1, "enable_flashcomm1": true}' \
         --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}'
     ```
 
@@ -719,7 +719,6 @@ If you want to deploy a multi-node environment, first verify the data-plane netw
         --kv-cache-dtype int8 \
         --attention_config.indexer_kv_dtype int8 \
         --additional-config '{
-            "scheduler_config": {"enable_balance_scheduling": true},
             "ascend_compilation_config": {"fuse_muls_add": true},
             "multistream_overlap_shared_expert": true,
             "enable_flashcomm1": true
@@ -788,7 +787,6 @@ If you want to deploy a multi-node environment, first verify the data-plane netw
         --kv-cache-dtype int8 \
         --attention_config.indexer_kv_dtype int8 \
         --additional-config '{
-            "scheduler_config": {"enable_balance_scheduling": true},
             "ascend_compilation_config": {"fuse_muls_add": true},
             "multistream_overlap_shared_expert": true,
             "enable_flashcomm1": true
@@ -833,17 +831,7 @@ headless engines are then rejected with
 Keep the API node's rank implicit so all four EngineCores join the same
 DP group.
 
-Use `scheduler_config.enable_balance_scheduling` and
-`ascend_compilation_config.fuse_muls_add` inside `--additional-config`.
-The scheduler setting belongs under `scheduler_config` (the top-level form
-is deprecated); `fuse_muls_add` belongs under `ascend_compilation_config`.
-
-Balance scheduling itself is deprecated as of v0.33.0 and planned for removal
-in a future release. Enabled configurations remain active with a startup warning.
-Set `scheduler_config.enable_balance_scheduling=false` and remove the legacy
-top-level key to disable the global admission gate across DP ranks. This can
-change throughput, TTFT, and TPOT; remeasure them for your workload. See
-[RFC #23229](https://github.com/vllm-project/vllm-ascend/issues/23229).
+Use `ascend_compilation_config.fuse_muls_add` inside `--additional-config`.
 
 **A2-specific environment variables:**
 

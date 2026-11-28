@@ -265,6 +265,8 @@ If you need to customize the profiling points, it is highly recommended to copy 
 
 After you change profiling symbols, restart the vLLM service so the updated configuration file is loaded.
 
+Balance scheduling has been removed. When reusing an older symbols YAML file, remove the entire `vllm_ascend.patch.platform.patch_balance_schedule:BalanceScheduler.schedule` entry before restarting the service. Existing symbols files are not overwritten automatically.
+
 ##### Field Descriptions
 
 | Field | Description | Example |

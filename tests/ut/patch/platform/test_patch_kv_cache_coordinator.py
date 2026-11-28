@@ -15,7 +15,7 @@ The patch ``0001-fix-mtp-prefix-cache-hit-hybrid-pd`` makes three changes to
    the coordinator - no role environment variable is involved.
 3. ``find_longest_cache_hit_per_group`` applies the same drop gating and
    keeps the ``(block_hashes, max_cache_hit_length)`` call convention used by
-   RecomputeScheduler / DyntraLB / BalanceScheduler.
+   RecomputeScheduler / DyntraLB.
 4. The producer/standalone EAGLE block-drop suppression is applied inline
    inside ``Scheduler._mamba_block_aligned_split`` (see
    ``patch_mamba_block_aligned_split``): on a pure producer or a standalone
@@ -441,7 +441,7 @@ def test_per_group_lookup_skips_drop_on_standalone():
 
 
 def test_per_group_lookup_matches_scheduler_call_convention():
-    # RecomputeScheduler / DyntraLBScheduler / BalanceScheduler all call with
+    # RecomputeScheduler / DyntraLBScheduler both call with
     # exactly two positional args: (request.block_hashes, request.num_tokens-1).
     coordinator = _make_lookup_coordinator(producer=True)
     block_hashes = ["hash-0", "hash-1"]

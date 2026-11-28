@@ -27,7 +27,7 @@ _server_cmd: &server_cmd
   - "ascend"
   - "--enable-chunked-prefill"
   - "--additional-config"
-  - '{"multistream_overlap_shared_expert":true,"scheduler_config":{"enable_balance_scheduling":true},"enable_mlapo":true}'
+  - '{"multistream_overlap_shared_expert":true,"enable_mlapo":true}'
   - "--compilation-config"
   - '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
   - "--speculative-config"

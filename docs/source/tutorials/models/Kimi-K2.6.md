@@ -136,13 +136,12 @@ vllm serve Eco-Tech/Kimi-K2.6-w4a8 \
     --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_with_stack": true}' \
     --mm-processor-cache-gb 0 \
     --mm-encoder-tp-mode data \
-    --additional-config '{"scheduler_config":{"enable_balance_scheduling":false},"enable_mlapo":true}' \
+    --additional-config '{"enable_mlapo":true}' \
     --speculative-config '{"method": "dflash","model": "z-lab/Kimi-K2.5-DFlash", "num_speculative_tokens": 15}'
 ```
 
 Key Parameter Descriptions:
 
-- `additional_config.scheduler_config.enable_balance_scheduling` is deprecated as of v0.33.0 and planned for removal in a future release. Enabled configurations remain active with a startup warning. The example above already uses `false`, so its scheduling behavior is unchanged. For existing enabled deployments, switching to `false` disables the global admission gate across DP ranks and can change throughput, TTFT, and TPOT; remeasure them for your workload. See [RFC #23229](https://github.com/vllm-project/vllm-ascend/issues/23229).
 - `--max-model-len` specifies the maximum context length — that is, the sum of input and output tokens for a single request. For performance testing with an input length of 3.5k and output length of 1.5k, a value of `15000` is sufficient, however, for precision testing, please set it at least `35000`.
 - `--no-enable-prefix-caching` indicates that prefix caching is disabled. To enable it, remove this option.
 - `--allowed-local-media-path` allows multimodal requests to load local media files, such as images and videos, from `/data/media` and its subdirectories on the server. Place the media files in this directory, or change the path to the directory containing your media files.

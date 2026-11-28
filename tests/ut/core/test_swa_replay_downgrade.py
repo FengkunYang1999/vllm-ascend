@@ -13,8 +13,8 @@
 # limitations under the License.
 """SWA bounded replay: where this backend has to turn the switch off.
 
-Upstream implements the rewind inside ``Scheduler.schedule()``. Four Ascend
-scheduling modes replace that method with a pinned copy of an older upstream
+Upstream implements the rewind inside ``Scheduler.schedule()``. Recompute and
+DyntraLB replace that method with a pinned copy of an older upstream
 body, so they neither rewind nor realize that the chunk they scheduled is a
 replay. Activating one of them therefore has to turn the switch off -- and only
 the switch, since the model wiring is what decides whether the sliding-window
@@ -35,7 +35,6 @@ from vllm_ascend.platform import (
 UNSUPPORTED_MODES = [
     ("recompute_scheduler_enable", {"recompute_scheduler_enable": True}),
     ("dyntra_lb_config", {"dyntra_lb_config": SimpleNamespace(enabled=True)}),
-    ("enable_balance_scheduling", {"enable_balance_scheduling": True}),
 ]
 
 V41 = ("DeepseekV41ForCausalLM",)
@@ -49,7 +48,6 @@ def _ascend_config(**overrides) -> SimpleNamespace:
         batch_job_sched_config=SimpleNamespace(enabled=True),
         # Not a fork either: does not override schedule() at all.
         short_request_first_config=SimpleNamespace(enabled=True),
-        enable_balance_scheduling=False,
     )
     for name, value in overrides.items():
         setattr(scheduler_config, name, value)
@@ -92,7 +90,7 @@ def test_unsupported_mode_turns_the_switch_off(mode, overrides):
 def test_switch_already_off_is_not_touched():
     vllm_config = _vllm_config(swa_bounded_replay=False)
 
-    _downgrade_swa_bounded_replay(vllm_config, _ascend_config(enable_balance_scheduling=True))
+    _downgrade_swa_bounded_replay(vllm_config, _ascend_config(recompute_scheduler_enable=True))
 
     assert not vllm_config.cache_config.swa_bounded_replay
 
@@ -116,7 +114,7 @@ def test_release_lane_without_the_switch_is_not_an_error():
 
     _downgrade_swa_bounded_replay(
         SimpleNamespace(cache_config=cache_config, model_config=SimpleNamespace(architectures=list(V41))),
-        _ascend_config(enable_balance_scheduling=True),
+        _ascend_config(recompute_scheduler_enable=True),
     )
 
     assert not hasattr(cache_config, "swa_bounded_replay")
@@ -139,9 +137,9 @@ def _warning_args(overrides, **config) -> tuple:
 
 def test_the_warning_names_the_mode_that_conflicts():
     """A user who reads only the mode has to know which knob to turn off."""
-    template, mode = _warning_args({"enable_balance_scheduling": True})
+    template, mode = _warning_args({"recompute_scheduler_enable": True})
 
-    assert mode == "enable_balance_scheduling"
+    assert mode == "recompute_scheduler_enable"
     assert "%s schedules with a pinned copy of the scheduler" in template
 
 
@@ -153,7 +151,7 @@ def test_a_model_that_cannot_replay_is_not_warned_about():
     vllm_config = _vllm_config(architectures=("DeepseekV4ForCausalLM",))
 
     with patch("vllm_ascend.platform.logger.warning_once") as warning:
-        _downgrade_swa_bounded_replay(vllm_config, _ascend_config(enable_balance_scheduling=True))
+        _downgrade_swa_bounded_replay(vllm_config, _ascend_config(recompute_scheduler_enable=True))
 
     warning.assert_not_called()
     assert not vllm_config.cache_config.swa_bounded_replay
